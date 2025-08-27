@@ -1,0 +1,36 @@
+# Data directories
+results/
+input/*.fa
+input/*.fasta
+input/*.fastq*
+logs/
+.snakemake/
+
+# Large files
+*.bam
+*.bai
+*.fq.gz
+*.fastq.gz
+*.fa
+*.fasta
+*.img
+*.sif
+
+# Temporary files
+*.tmp
+*.log
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Keep only pipeline code and configs
+!snakefile
+!*.sh
+!*.py
+!*.yml
+!*.yaml
+!README.md
