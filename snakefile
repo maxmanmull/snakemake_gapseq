@@ -206,31 +206,37 @@ rule map_reads_to_assembly:
 
 rule calculate_coverage:
     """
-    Calculate coverage depth for binning
+    Calculate coverage depth for binning using CONCOCT's proper tools
     """
     input:
         contigs = rules.assemble_reads.output.contigs,
         bam = rules.map_reads_to_assembly.output.bam
     output:
         coverage = f"{BINNING_DIR}/{{sample}}/coverage_table.tsv"
+    params:
+        outdir = f"{BINNING_DIR}/{{sample}}"
     threads: 1
+    container: CONTAINERS["concoct"]  # Container BEFORE shell
     shell:
         """
-        # Create header
-        echo -e "contig\\t{wildcards.sample}.bam" > {output.coverage}
+        # First cut up the contigs and create BED file
+        cut_up_fasta.py \
+            {input.contigs} \
+            -c 10000 -o 0 \
+            --merge_last \
+            -b {params.outdir}/contigs_10K.bed \
+            > {params.outdir}/contigs_10K.fa
         
-        # Calculate mean coverage per contig
-        singularity exec {CONTAINERS[samtools]} samtools depth -aa {input.bam} | \\
-            awk 'BEGIN{{prev=""}} \\
-                {{if($1!=prev && NR>1){{print prev"\\t"sum/count; sum=0; count=0}} \\
-                prev=$1; sum+=$3; count++}} \\
-                END{{if(prev!="") print prev"\\t"sum/count}}' >> {output.coverage}
+        # Then use CONCOCT's coverage table tool with BED and BAM
+        concoct_coverage_table.py \
+            {params.outdir}/contigs_10K.bed \
+            {input.bam} \
+            > {output.coverage}
         """
 # ================== MODULE 5: Binning ==================
-
 rule binning_concoct:
     """
-    Bin contigs using CONCOCT - handles cases with no bins gracefully
+    Bin contigs using CONCOCT
     """
     input:
         contigs = rules.assemble_reads.output.contigs,
@@ -240,65 +246,80 @@ rule binning_concoct:
         clustering = f"{BINNING_DIR}/{{sample}}/concoct_clustering.csv",
         completed = f"{BINNING_DIR}/{{sample}}/bins_completed.txt"
     params:
-        outdir = f"{BINNING_DIR}/{{sample}}",
-        container = CONTAINERS["concoct"]
+        outdir = f"{BINNING_DIR}/{{sample}}"
     threads: 1
     resources:
         mem_mb=32000,
         time="12:00:00",
         binning=1
+    container: CONTAINERS["concoct"]  # Container BEFORE shell
     shell:
         """
         # Create output directories
-        mkdir -p {params.outdir}
+        mkdir -p {params.outdir}/concoct_output
         mkdir -p {output.bins_dir}
         
-        # Cut contigs into chunks for CONCOCT
-        singularity exec {params.container} cut_up_fasta.py \
-            {input.contigs} -c 10000 -o 0 \
-            --merge_last -b {params.outdir}/contigs_10K.bed \
-            > {params.outdir}/contigs_10K.fa
+        # The cut contigs and bed file already exist from calculate_coverage rule
+        CUT_CONTIGS={params.outdir}/contigs_10K.fa
         
-        # Prepare coverage file
-        awk 'BEGIN{{OFS="\\t"}} NR==1{{$1="contig"; $2="coverage"}} {{print}}' \
-            {input.coverage} > {params.outdir}/coverage_formatted.tsv
-        
-        # Run CONCOCT (allow it to fail)
-        singularity exec {params.container} concoct \
-            --composition_file {params.outdir}/contigs_10K.fa \
-            --coverage_file {params.outdir}/coverage_formatted.tsv \
-            -b {params.outdir}/ \
-            -t {threads} || true
-        
-        # Check if clustering was produced and process accordingly
-        if [ -f {params.outdir}/clustering_gt1000.csv ]; then
-            # CONCOCT succeeded - merge and extract bins
-            singularity exec {params.container} merge_cutup_clustering.py \
-                {params.outdir}/clustering_gt1000.csv \
-                > {output.clustering}
-            
-            singularity exec {params.container} extract_fasta_bins.py \
-                {input.contigs} \
-                {output.clustering} \
-                --output_path {output.bins_dir}
-            
-            # List bins if any were created
-            ls {output.bins_dir}/*.fa > {output.completed} 2>/dev/null || echo "no_bins_found" > {output.completed}
+        # Check if we have enough contigs
+        if [ -f "$CUT_CONTIGS" ]; then
+            NUM_CONTIGS=$(grep -c "^>" $CUT_CONTIGS 2>/dev/null || echo "0")
         else
-            # CONCOCT didn't produce clustering - create empty outputs
+            NUM_CONTIGS=0
+        fi
+        
+        echo "Cut contigs: $NUM_CONTIGS"
+        
+        if [ "$NUM_CONTIGS" -lt 4 ]; then
+            echo "Too few contigs for binning"
             echo "contig_id,cluster_id" > {output.clustering}
             echo "no_bins_found" > {output.completed}
+        else
+            # Run CONCOCT
+            concoct \
+                --composition_file $CUT_CONTIGS \
+                --coverage_file {input.coverage} \
+                -b {params.outdir}/concoct_output/ \
+                -t {threads} \
+                --iterations 500 \
+                --seed 42 || true
+            
+            # Process results if successful
+            if [ -f {params.outdir}/concoct_output/clustering_gt1000.csv ]; then
+                # Merge clustering
+                merge_cutup_clustering.py \
+                    {params.outdir}/concoct_output/clustering_gt1000.csv \
+                    > {output.clustering}
+                
+                # Extract bins
+                extract_fasta_bins.py \
+                    {input.contigs} \
+                    {output.clustering} \
+                    --output_path {output.bins_dir}
+                
+                # List bins
+                ls {output.bins_dir}/*.fa > {output.completed} 2>/dev/null || echo "no_bins_found" > {output.completed}
+            else
+                echo "CONCOCT produced no clustering"
+                echo "contig_id,cluster_id" > {output.clustering}
+                echo "no_bins_found" > {output.completed}
+            fi
         fi
         
         # Ensure outputs exist
         touch {output.clustering}
         touch {output.completed}
         """
+
+
 # ================== MODULE 6: Initial Bin Quality Check ==================
+# Fixed CheckM rule with correct column parsing and no bc dependency
 
 rule checkm_bins:
     """
-    Check quality of bins using CheckM - handles no bins gracefully
+    Check quality of bins using CheckM and filter based on completeness/contamination
+    Fixed: correct column numbers and no bc command
     """
     input:
         bins_dir = rules.binning_concoct.output.bins_dir,
@@ -310,13 +331,13 @@ rule checkm_bins:
         outdir = f"{CHECKM_DIR}/{{sample}}",
         completeness = config.get("checkm_completeness_threshold", 50),
         contamination = config.get("checkm_contamination_threshold", 10)
-    threads: 1
+    threads: 8
     container: CONTAINERS["checkm"]
     shell:
         """
         # Check if we have any bins
         if grep -q "\.fa$" {input.completed}; then
-            # Run CheckM
+            # Run CheckM lineage workflow
             checkm lineage_wf \
                 -t {threads} \
                 -x fa \
@@ -324,13 +345,51 @@ rule checkm_bins:
                 {params.outdir} \
                 > {output.results}
             
+            # Create quality assessment table
+            checkm qa \
+                -o 2 \
+                -f {params.outdir}/checkm_table.tsv \
+                --tab_table \
+                {params.outdir}/lineage.ms \
+                {params.outdir}
+            
             # Filter bins based on quality thresholds
-            grep -E "^\\s*[0-9]+" {output.results} | \
-                awk '$12 >= {params.completeness} && $13 <= {params.contamination} {{print $1}}' \
-                > {output.filtered_bins}
+            echo "Filtering bins with thresholds: Completeness>={params.completeness}%, Contamination<={params.contamination}%"
+            
+            # Parse CheckM table with CORRECT columns (6=completeness, 7=contamination)
+            > {output.filtered_bins}
+            tail -n +2 {params.outdir}/checkm_table.tsv | while IFS=$'\t' read -r bin_id col2 col3 col4 col5 completeness contamination rest; do
+                
+                # Use awk for floating point comparison (bc not available)
+                PASS=$(awk -v comp="$completeness" -v cont="$contamination" -v min_comp="{params.completeness}" -v max_cont="{params.contamination}" \
+                       'BEGIN {{if(comp >= min_comp && cont <= max_cont) print "YES"; else print "NO"}}')
+                
+                if [ "$PASS" == "YES" ]; then
+                    echo "$bin_id" >> {output.filtered_bins}
+                    echo "  ✓ PASS: $bin_id (C:${{completeness}}%, Cont:${{contamination}}%)"
+                else
+                    echo "  ✗ FAIL: $bin_id (C:${{completeness}}%, Cont:${{contamination}}%)"
+                fi
+            done
+            
+            # Report summary
+            TOTAL_BINS=$(ls {input.bins_dir}/*.fa 2>/dev/null | wc -l)
+            GOOD_BINS=$(cat {output.filtered_bins} 2>/dev/null | wc -l)
+            echo ""
+            echo "CheckM Summary for {wildcards.sample}:"
+            echo "  Total bins: $TOTAL_BINS"
+            echo "  Passed QC: $GOOD_BINS"
+            echo "  Failed QC: $((TOTAL_BINS - GOOD_BINS))"
+            
+            # If no bins pass, suggest processing whole assembly
+            if [ "$GOOD_BINS" -eq 0 ]; then
+                echo ""
+                echo "  No bins passed quality thresholds for {wildcards.sample}"
+                echo "  Consider processing the whole assembly as a single genome"
+            fi
+            
         else
-            # No bins to check
-            echo "No bins found for sample {wildcards.sample}" > {output.results}
+            echo "No bins found for {wildcards.sample}" > {output.results}
             touch {output.filtered_bins}
         fi
         """
