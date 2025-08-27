@@ -109,7 +109,7 @@ rule trim_reads:
     params:
         quality = config.get("trim_quality", 20),
         min_length = config.get("trim_min_length", 50)
-    threads: 4
+    threads: 1
     container: CONTAINERS["trimgalore"]
     shell:
         """
@@ -137,7 +137,7 @@ rule assemble_reads:
     params:
         outdir = f"{ASSEMBLY_DIR}/{{sample}}",
         kmers = config.get("spades_kmers", "21,33,55,77")
-    threads: 16
+    threads: 1
     resources:
         mem_mb=120000,
         time="24:00:00",
@@ -166,7 +166,7 @@ rule quast_assembly:
         report = f"{QC_DIR}/assembly/{{sample}}/report.txt"
     params:
         outdir = f"{QC_DIR}/assembly/{{sample}}"
-    threads: 4
+    threads: 1
     container: CONTAINERS["quast"]
     shell:
         """
@@ -190,7 +190,7 @@ rule map_reads_to_assembly:
     output:
         bam = f"{BINNING_DIR}/{{sample}}/{{sample}}_mapped.sorted.bam",
         bai = f"{BINNING_DIR}/{{sample}}/{{sample}}_mapped.sorted.bam.bai"
-    threads: 8
+    threads: 1
     shell:
         """
         # Index contigs
@@ -230,7 +230,7 @@ rule calculate_coverage:
 
 rule binning_concoct:
     """
-    Bin contigs using CONCOCT
+    Bin contigs using CONCOCT - handles cases with no bins gracefully
     """
     input:
         contigs = rules.assemble_reads.output.contigs,
@@ -240,46 +240,65 @@ rule binning_concoct:
         clustering = f"{BINNING_DIR}/{{sample}}/concoct_clustering.csv",
         completed = f"{BINNING_DIR}/{{sample}}/bins_completed.txt"
     params:
-        outdir = f"{BINNING_DIR}/{{sample}}"
-    threads: 8
+        outdir = f"{BINNING_DIR}/{{sample}}",
+        container = CONTAINERS["concoct"]
+    threads: 1
     resources:
         mem_mb=32000,
         time="12:00:00",
-        binning=1  # Resource group to limit concurrent binning
-    container: CONTAINERS["concoct"]
+        binning=1
     shell:
         """
+        # Create output directories
+        mkdir -p {params.outdir}
+        mkdir -p {output.bins_dir}
+        
         # Cut contigs into chunks for CONCOCT
-        cut_up_fasta.py {input.contigs} -c 10000 -o 0 \
+        singularity exec {params.container} cut_up_fasta.py \
+            {input.contigs} -c 10000 -o 0 \
             --merge_last -b {params.outdir}/contigs_10K.bed \
             > {params.outdir}/contigs_10K.fa
         
-        # Run CONCOCT
-        concoct \
+        # Prepare coverage file
+        awk 'BEGIN{{OFS="\\t"}} NR==1{{$1="contig"; $2="coverage"}} {{print}}' \
+            {input.coverage} > {params.outdir}/coverage_formatted.tsv
+        
+        # Run CONCOCT (allow it to fail)
+        singularity exec {params.container} concoct \
             --composition_file {params.outdir}/contigs_10K.fa \
-            --coverage_file {input.coverage} \
+            --coverage_file {params.outdir}/coverage_formatted.tsv \
             -b {params.outdir}/ \
-            -t {threads}
+            -t {threads} || true
         
-        # Merge clustering results
-        merge_cutup_clustering.py {params.outdir}/clustering_gt1000.csv \
-            > {output.clustering}
+        # Check if clustering was produced and process accordingly
+        if [ -f {params.outdir}/clustering_gt1000.csv ]; then
+            # CONCOCT succeeded - merge and extract bins
+            singularity exec {params.container} merge_cutup_clustering.py \
+                {params.outdir}/clustering_gt1000.csv \
+                > {output.clustering}
+            
+            singularity exec {params.container} extract_fasta_bins.py \
+                {input.contigs} \
+                {output.clustering} \
+                --output_path {output.bins_dir}
+            
+            # List bins if any were created
+            ls {output.bins_dir}/*.fa > {output.completed} 2>/dev/null || echo "no_bins_found" > {output.completed}
+        else
+            # CONCOCT didn't produce clustering - create empty outputs
+            echo "contig_id,cluster_id" > {output.clustering}
+            echo "no_bins_found" > {output.completed}
+        fi
         
-        # Extract bins
-        mkdir -p {output.bins_dir}
-        extract_fasta_bins.py {input.contigs} \
-            {output.clustering} \
-            --output_path {output.bins_dir}
-        
-        # Mark completion and list bins
-        ls {output.bins_dir}/*.fa > {output.completed} 2>/dev/null || echo "No bins found" > {output.completed}
+        # Ensure outputs exist
+        touch {output.clustering}
+        touch {output.completed}
         """
-
 # ================== MODULE 6: Initial Bin Quality Check ==================
 
 rule checkm_bins:
     """
-    Check quality of bins using CheckM
+    Check quality of bins using CheckM - handles no bins gracefully
     """
     input:
         bins_dir = rules.binning_concoct.output.bins_dir,
@@ -291,28 +310,35 @@ rule checkm_bins:
         outdir = f"{CHECKM_DIR}/{{sample}}",
         completeness = config.get("checkm_completeness_threshold", 50),
         contamination = config.get("checkm_contamination_threshold", 10)
-    threads: 8
+    threads: 1
     container: CONTAINERS["checkm"]
     shell:
         """
-        checkm lineage_wf \
-            -t {threads} \
-            -x fa \
-            {input.bins_dir} \
-            {params.outdir} \
-            > {output.results}
-        
-        # Filter bins based on quality thresholds
-        grep -E "^\s*[0-9]+" {output.results} | \
-            awk '$12 >= {params.completeness} && $13 <= {params.contamination} {{print $1}}' \
-            > {output.filtered_bins}
+        # Check if we have any bins
+        if grep -q "\.fa$" {input.completed}; then
+            # Run CheckM
+            checkm lineage_wf \
+                -t {threads} \
+                -x fa \
+                {input.bins_dir} \
+                {params.outdir} \
+                > {output.results}
+            
+            # Filter bins based on quality thresholds
+            grep -E "^\\s*[0-9]+" {output.results} | \
+                awk '$12 >= {params.completeness} && $13 <= {params.contamination} {{print $1}}' \
+                > {output.filtered_bins}
+        else
+            # No bins to check
+            echo "No bins found for sample {wildcards.sample}" > {output.results}
+            touch {output.filtered_bins}
+        fi
         """
-
 # ================== MODULE 7: Process Individual Bins (Parallel) ==================
 
 checkpoint get_bins:
     """
-    Get list of bins for a sample to process and prepare for batch GTDB-Tk
+    Get list of bins for a sample to process - handles no bins gracefully
     """
     input:
         bins_dir = f"{BINNING_DIR}/{{sample}}/bins",
@@ -323,15 +349,18 @@ checkpoint get_bins:
         """
         mkdir -p {BINS_DIR}/{wildcards.sample}
         
-        # List all good quality bins for processing
-        for bin_id in $(cat {input.filtered}); do
-            if [ -f {input.bins_dir}/${{bin_id}}.fa ]; then
-                echo "${{bin_id}}" >> {output.bins_list}
-                cp {input.bins_dir}/${{bin_id}}.fa {BINS_DIR}/{wildcards.sample}/
-            fi
-        done
+        # Check if we have any good quality bins
+        if [ -s {input.filtered} ]; then
+            # Process good quality bins
+            for bin_id in $(cat {input.filtered}); do
+                if [ -f {input.bins_dir}/${{bin_id}}.fa ]; then
+                    echo "${{bin_id}}" >> {output.bins_list}
+                    cp {input.bins_dir}/${{bin_id}}.fa {BINS_DIR}/{wildcards.sample}/
+                fi
+            done
+        fi
         
-        # If no good bins, create a placeholder
+        # If no bins were found, create a marker
         if [ ! -s {output.bins_list} ]; then
             echo "no_bins_found" > {output.bins_list}
         fi
@@ -398,7 +427,7 @@ rule gtdbtk_classify_batch:
     params:
         outdir = f"{GTDBTK_DIR}/batch_results",
         db_path = GTDBTK_DB
-    threads: 32  # Use more threads for batch processing
+    threads: 10  # Use more threads for batch processing
     resources:
         mem_mb=128000,  # More memory for batch
         time="24:00:00",
@@ -523,7 +552,7 @@ rule gapseq_find_pathways_bin:
         pathways = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-Pathways.tbl"
     params:
         prefix = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}"
-    threads: 4
+    threads: 32
     resources:
         mem_mb=16000,
         time="06:00:00",
@@ -549,7 +578,7 @@ rule gapseq_find_transport_bin:
         transport = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-Transporter.tbl"
     params:
         prefix = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}"
-    threads: 4
+    threads: 1
     resources:
         mem_mb=16000,
         time="06:00:00",
@@ -607,38 +636,58 @@ rule gapseq_fill_bin:
         """
 
 # Aggregate rule for all bins of a sample
+
 def get_all_bin_outputs(wildcards):
     """
-    Get all expected outputs for bins of a sample (excluding GTDB-Tk which is batch)
+    Get all expected outputs for bins of a sample - handles no bins case
     """
     checkpoint_output = checkpoints.get_bins.get(**wildcards).output[0]
+    
+    # Read the bins list file
+    with open(checkpoint_output) as f:
+        content = f.read().strip()
+    
+    # Check if there are no bins
+    if content == "no_bins_found" or not content:
+        # Return empty list - no bin processing needed
+        return []
+    
+    # Process each bin
+    outputs = []
     with open(checkpoint_output) as f:
         bin_ids = [line.strip() for line in f if line.strip() and line.strip() != "no_bins_found"]
     
-    outputs = []
     for bin_id in bin_ids:
         outputs.extend([
             f"{PRODIGAL_DIR}/bins/{wildcards.sample}/{bin_id}/proteins.faa",
             f"{GAPSEQ_DIR}/bins/{wildcards.sample}/{bin_id}/{bin_id}_model.RDS"
         ])
+    
     return outputs
+
 
 rule process_all_bins:
     """
-    Process all bins for a sample (GTDB-Tk is handled separately in batch)
+    Process all bins for a sample - handles no bins case
     """
     input:
         get_all_bin_outputs,
-        gtdbtk_parsed = f"{GTDBTK_DIR}/batch_results_parsed.txt"  # Ensure GTDB-Tk batch is done
+        gtdbtk_parsed = f"{GTDBTK_DIR}/batch_results_parsed.txt"
     output:
         f"{BINS_DIR}/{{sample}}/all_bins_processed.txt"
     shell:
         """
-        echo "All bins processed for {wildcards.sample}" > {output}
-        echo "Processed bins:" >> {output}
-        ls {GAPSEQ_DIR}/bins/{wildcards.sample}/*/{{*}}_model.RDS 2>/dev/null | wc -l >> {output} || echo "0" >> {output}
+        echo "Bins processing complete for {wildcards.sample}" > {output}
+        
+        # Count processed bins
+        if [ -d {GAPSEQ_DIR}/bins/{wildcards.sample} ]; then
+            NUM_BINS=$(ls {GAPSEQ_DIR}/bins/{wildcards.sample}/*/{{*}}_model.RDS 2>/dev/null | wc -l || echo "0")
+        else
+            NUM_BINS=0
+        fi
+        
+        echo "Processed bins: $NUM_BINS" >> {output}
         """
-
 # ================== MODULE 8: Process FASTA samples (no individual GTDB-Tk) ==================
 
 rule prodigal_genes_fasta:
@@ -673,7 +722,7 @@ rule gapseq_find_pathways_fasta:
         pathways = f"{GAPSEQ_DIR}/fasta/{{sample}}/pathways.tbl"
     params:
         prefix = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}"
-    threads: 8
+    threads: 1
     container: CONTAINERS["gapseq"]
     shell:
         """
@@ -695,7 +744,7 @@ rule gapseq_find_transport_fasta:
         transport = f"{GAPSEQ_DIR}/fasta/{{sample}}/transporters.tbl"
     params:
         prefix = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}"
-    threads: 8
+    threads: 1
     container: CONTAINERS["gapseq"]
     shell:
         """
