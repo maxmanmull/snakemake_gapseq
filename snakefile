@@ -88,7 +88,7 @@ rule all:
         # For each FASTQ sample, process all bins
         expand(f"{BINS_DIR}/{{sample}}/all_bins_processed.txt", sample=FASTQ_SAMPLES),
         # For FASTA samples, process directly (no GTDB-Tk here since it's in batch)
-        expand(f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}_model.RDS", sample=FASTA_SAMPLES),
+        expand(f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}.RDS", sample=FASTA_SAMPLES),
         # Final QC report
         f"{FINAL_QC_DIR}/final_report.html"
 
@@ -428,11 +428,12 @@ checkpoint get_bins:
 # Batch GTDB-Tk for all samples
 rule prepare_gtdbtk_batch:
     """
-    Prepare all genomes for batch GTDB-Tk processing
+    Prepare all genomes for batch GTDB-Tk processing - fixed version
     """
     input:
-        # Collect all bins from all FASTQ samples
-        bins_lists = expand(f"{BINS_DIR}/{{sample}}/bins_to_process.txt", sample=FASTQ_SAMPLES),
+        # Make bins_lists optional - don't wait for all samples
+        bins_lists = expand(f"{BINS_DIR}/{{sample}}/bins_to_process.txt", 
+                          sample=FASTQ_SAMPLES),
         # Include FASTA samples
         fasta_files = [FASTA_PATHS.get(s, f"{INPUT_DIR}/{s}") for s in FASTA_SAMPLES]
     output:
@@ -446,19 +447,32 @@ rule prepare_gtdbtk_batch:
         os.makedirs(output.genome_dir, exist_ok=True)
         genome_paths = []
         
-        # Copy all MAG bins
+        # Copy all MAG bins that exist
         for sample in FASTQ_SAMPLES:
-            bins_list_file = f"{BINS_DIR}/{sample}/bins_to_process.txt"
-            if os.path.exists(bins_list_file):
-                with open(bins_list_file, 'r') as f:
-                    for bin_id in f:
-                        bin_id = bin_id.strip()
-                        if bin_id and bin_id != "no_bins_found":
-                            src = f"{BINS_DIR}/{sample}/{bin_id}.fa"
+            # Check both 05_bins and 04_binning for bins
+            bins_processed = False
+            
+            # Try 05_bins first (quality filtered)
+            bins_dir_filtered = f"{BINS_DIR}/{sample}"
+            if os.path.exists(bins_dir_filtered):
+                for bin_file in glob.glob(f"{bins_dir_filtered}/*.fa"):
+                    if os.path.exists(bin_file):
+                        bin_id = os.path.basename(bin_file).replace('.fa', '')
+                        dst = f"{output.genome_dir}/{sample}_{bin_id}.fa"
+                        shutil.copy(bin_file, dst)
+                        genome_paths.append(dst)
+                        bins_processed = True
+            
+            # If no quality bins, check raw bins
+            if not bins_processed:
+                bins_dir_raw = f"{BINNING_DIR}/{sample}/bins"
+                if os.path.exists(bins_dir_raw):
+                    for bin_file in glob.glob(f"{bins_dir_raw}/*.fa"):
+                        if os.path.exists(bin_file):
+                            bin_id = os.path.basename(bin_file).replace('.fa', '')
                             dst = f"{output.genome_dir}/{sample}_{bin_id}.fa"
-                            if os.path.exists(src):
-                                shutil.copy(src, dst)
-                                genome_paths.append(dst)
+                            shutil.copy(bin_file, dst)
+                            genome_paths.append(dst)
         
         # Copy all FASTA samples
         for fasta_file in input.fasta_files:
@@ -470,8 +484,14 @@ rule prepare_gtdbtk_batch:
         
         # Write list of all genomes
         with open(output.genome_list, 'w') as f:
-            for path in genome_paths:
-                f.write(f"{path}\n")
+            if genome_paths:
+                for path in genome_paths:
+                    f.write(f"{path}\n")
+            else:
+                f.write("# No genomes found\n")
+        
+        print(f"Prepared {len(genome_paths)} genomes for GTDB-Tk")
+
 
 rule gtdbtk_classify_batch:
     """
@@ -486,11 +506,11 @@ rule gtdbtk_classify_batch:
     params:
         outdir = f"{GTDBTK_DIR}/batch_results",
         db_path = GTDBTK_DB
-    threads: 10  # Use more threads for batch processing
+    threads: 10
     resources:
-        mem_mb=128000,  # More memory for batch
+        mem_mb=128000,
         time="24:00:00",
-        gtdbtk=1  # Still limit to 1 GTDB-Tk job at a time
+        gtdbtk=1
     container: CONTAINERS["gtdbtk"]
     shell:
         """
@@ -501,15 +521,14 @@ rule gtdbtk_classify_batch:
         echo "Processing $NUM_GENOMES genomes in batch mode"
         
         if [ "$NUM_GENOMES" -gt 0 ]; then
-            # Run GTDB-Tk in batch mode
+            # Run GTDB-Tk WITHOUT the invalid --batch_file argument
             gtdbtk classify_wf \
                 --genome_dir {input.genome_dir} \
                 --extension fa \
                 --out_dir {params.outdir} \
                 --cpus {threads} \
                 --pplacer_cpus {threads} \
-                --skip_ani_screen \
-                --batch_file {input.genome_list}
+                --skip_ani_screen
             
             echo "GTDB-Tk batch processing complete" > {output.done}
         else
@@ -517,7 +536,6 @@ rule gtdbtk_classify_batch:
             touch {output.summary}
         fi
         """
-
 # Parse batch results back to individual samples
 rule parse_gtdbtk_results:
     """
@@ -598,7 +616,6 @@ rule prodigal_genes_bin:
             -d {output.genes} \
             -f gff \
             -o {output.gff} \
-            -p meta
         """
 
 rule gapseq_find_pathways_bin:
@@ -608,23 +625,16 @@ rule gapseq_find_pathways_bin:
     input:
         bin = f"{BINS_DIR}/{{sample}}/{{bin_id}}.fa"
     output:
-        pathways = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-Pathways.tbl"
+        pathways = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-all-Pathways.tbl",
+        reactions = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-all-Reactions.tbl"
     params:
-        prefix = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}"
-    threads: 32
-    resources:
-        mem_mb=16000,
-        time="06:00:00",
-        mag_analysis=1  # Counts as MAG analysis
+        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
+    threads: 1
     container: CONTAINERS["gapseq"]
     shell:
         """
-        gapseq find -u Pathways \
-            -p all \
-            -b 200 \
-            -t {threads} \
-            {input.bin} \
-            -f $(dirname {params.prefix})
+        cd {params.outdir}
+        gapseq find -p all {input.bin}
         """
 
 rule gapseq_find_transport_bin:
@@ -636,19 +646,13 @@ rule gapseq_find_transport_bin:
     output:
         transport = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-Transporter.tbl"
     params:
-        prefix = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}"
+        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
     threads: 1
-    resources:
-        mem_mb=16000,
-        time="06:00:00",
-        mag_analysis=1  # Counts as MAG analysis
     container: CONTAINERS["gapseq"]
     shell:
         """
-        gapseq find-transport -u Transporter \
-            -b 200 \
-            {input.bin} \
-            -f $(dirname {params.prefix})
+        cd {params.outdir}
+        gapseq find-transport {input.bin}
         """
 
 rule gapseq_draft_bin:
@@ -658,42 +662,48 @@ rule gapseq_draft_bin:
     input:
         bin = f"{BINS_DIR}/{{sample}}/{{bin_id}}.fa",
         pathways = rules.gapseq_find_pathways_bin.output.pathways,
+        reactions = rules.gapseq_find_pathways_bin.output.reactions,
         transport = rules.gapseq_find_transport_bin.output.transport
     output:
-        draft = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}_draft.RDS"
+        draft = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-draft.RDS",
+        rxnWeights = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-rxnWeights.RDS",
+        rxnXgenes = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-rxnXgenes.RDS"
     params:
-        prefix = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}"
+        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
     container: CONTAINERS["gapseq"]
     shell:
         """
+        cd {params.outdir}
         gapseq draft \
-            -r {input.pathways} \
+            -r {input.reactions} \
             -t {input.transport} \
-            -c {input.bin} \
-            -f $(dirname {params.prefix})_draft
+            -p {input.pathways} \
+            -c {input.bin}
         """
 
 rule gapseq_fill_bin:
     """
-    Fill metabolic model with media-specific gap-filling for individual bin
+    Fill metabolic model with media-specific gap-filling
     """
     input:
         draft = rules.gapseq_draft_bin.output.draft,
+        rxnWeights = rules.gapseq_draft_bin.output.rxnWeights,
+        rxnXgenes = rules.gapseq_draft_bin.output.rxnXgenes,
         media = lambda wildcards: f"{MEDIA_DIR}/{SAMPLE_MEDIA[wildcards.sample]}_media.csv"
     output:
-        model = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}_model.RDS"
+        model = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}.RDS"
     params:
-        prefix = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}"
+        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
     container: CONTAINERS["gapseq"]
     shell:
         """
+        cd {params.outdir}
         gapseq fill \
             -m {input.draft} \
-            -n {input.media} \
-            -c {input.draft} \
-            -f $(dirname {params.prefix})_model
+            -c {input.rxnWeights} \
+            -g {input.rxnXgenes} \
+            -n {input.media}
         """
-
 # Aggregate rule for all bins of a sample
 
 def get_all_bin_outputs(wildcards):
@@ -778,19 +788,16 @@ rule gapseq_find_pathways_fasta:
     input:
         genome = lambda wildcards: FASTA_PATHS.get(wildcards.sample, f"{INPUT_DIR}/{wildcards.sample}")
     output:
-        pathways = f"{GAPSEQ_DIR}/fasta/{{sample}}/pathways.tbl"
+        pathways = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-all-Pathways.tbl",
+        reactions = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-all-Reactions.tbl"
     params:
-        prefix = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}"
+        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
     threads: 1
     container: CONTAINERS["gapseq"]
     shell:
         """
-        gapseq find -u Pathways \
-            -p all \
-            -b 200 \
-            -t {threads} \
-            {input.genome} \
-            -f $(dirname {params.prefix})
+        cd {params.outdir}
+        gapseq find -p all {input.genome}
         """
 
 rule gapseq_find_transport_fasta:
@@ -800,17 +807,15 @@ rule gapseq_find_transport_fasta:
     input:
         genome = lambda wildcards: FASTA_PATHS.get(wildcards.sample, f"{INPUT_DIR}/{wildcards.sample}")
     output:
-        transport = f"{GAPSEQ_DIR}/fasta/{{sample}}/transporters.tbl"
+        transport = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-Transporter.tbl"
     params:
-        prefix = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}"
+        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
     threads: 1
     container: CONTAINERS["gapseq"]
     shell:
         """
-        gapseq find-transport -u Transporter \
-            -b 200 \
-            {input.genome} \
-            -f $(dirname {params.prefix})
+        cd {params.outdir}
+        gapseq find-transport {input.genome}
         """
 
 rule gapseq_draft_fasta:
@@ -820,19 +825,23 @@ rule gapseq_draft_fasta:
     input:
         genome = lambda wildcards: FASTA_PATHS.get(wildcards.sample, f"{INPUT_DIR}/{wildcards.sample}"),
         pathways = rules.gapseq_find_pathways_fasta.output.pathways,
+        reactions = rules.gapseq_find_pathways_fasta.output.reactions,
         transport = rules.gapseq_find_transport_fasta.output.transport
     output:
-        draft = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}_draft.RDS"
+        draft = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-draft.RDS",
+        rxnWeights = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-rxnWeights.RDS",
+        rxnXgenes = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-rxnXgenes.RDS"
     params:
-        prefix = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}"
+        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
     container: CONTAINERS["gapseq"]
     shell:
         """
+        cd {params.outdir}
         gapseq draft \
-            -r {input.pathways} \
+            -r {input.reactions} \
             -t {input.transport} \
-            -c {input.genome} \
-            -f $(dirname {params.prefix})_draft
+            -p {input.pathways} \
+            -c {input.genome}
         """
 
 rule gapseq_fill_fasta:
@@ -841,21 +850,23 @@ rule gapseq_fill_fasta:
     """
     input:
         draft = rules.gapseq_draft_fasta.output.draft,
+        rxnWeights = rules.gapseq_draft_fasta.output.rxnWeights,
+        rxnXgenes = rules.gapseq_draft_fasta.output.rxnXgenes,
         media = lambda wildcards: f"{MEDIA_DIR}/{SAMPLE_MEDIA[wildcards.sample]}_media.csv"
     output:
-        model = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}_model.RDS"
+        model = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}.RDS"
     params:
-        prefix = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}"
+        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
     container: CONTAINERS["gapseq"]
     shell:
         """
+        cd {params.outdir}
         gapseq fill \
             -m {input.draft} \
-            -n {input.media} \
-            -c {input.draft} \
-            -f $(dirname {params.prefix})_model
+            -c {input.rxnWeights} \
+            -g {input.rxnXgenes} \
+            -n {input.media}
         """
-
 # ================== MODULE 9: Final Quality Control ==================
 
 rule final_multiqc:

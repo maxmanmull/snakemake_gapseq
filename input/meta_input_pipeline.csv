@@ -1,8 +1,9 @@
-﻿Comment ,Taurine,Creatinine,Carnitine,Xylan,Chitin,Filetype
+Comment,Taurine,Creatinine,Carnitine,Xylan,Chitin,Filetype
 MAG,Marinacidobacteraceae.fa,Marinacidobacteraceae.fa,Marinacidobacteraceae.fa,Marinacidobacteraceae.fa,Marinacidobacteraceae.fa,.fa
-,5,,459,482,536,.fastq
-,4,,291,468,,.fastq
-,3,,336,,,.fastq
+,12,,459,581,539,.fastq
+,5,,291,482,536,.fastq
+,4,,336,468,,.fastq
+,3,,,,,.fastq
 ,2,,,,,.fastq
 ,1,,,,,.fastq
 ,482,,,,,.fastq
