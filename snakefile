@@ -1,148 +1,88 @@
-import os
 import pandas as pd
 from pathlib import Path
 import glob
-
 # Configuration
-configfile: "config.yaml"
+SINGULARITY_DIR = "/lustre/BIF/nobackup/mulle088/singularity"
+DATA_DIR = "/lustre/BIF/nobackup/mulle088/data_rp/90-1196727703/00_fastq"
+RESULTS_DIR = "results"
 
-# Load FASTA paths if available
-if os.path.exists("config_paths.yaml"):
-    configfile: "config_paths.yaml"
+# Parse metadata to get FASTQ and FASTA samples
+metadata = pd.read_csv("input/meta_input_pipeline.csv")
+FASTQ_SAMPLES = []
+FASTA_SAMPLES = []
 
-# Paths
-BASE_DIR = config.get("base_dir", "/lustre/BIF/nobackup/mulle088")
-SINGULARITY_DIR = config.get("singularity_dir", f"{BASE_DIR}/singularity")
-DATA_DIR = config.get("data_dir", f"{BASE_DIR}/data_rp/90-1196727703/00_fastq")
-MEDIA_DIR = config.get("media_dir", f"{BASE_DIR}/gapseq_pipeline_final/media")
-INPUT_DIR = config.get("input_dir", "input")  # Local input directory
-GTDBTK_DB = config.get("gtdbtk_db", f"{BASE_DIR}/gapseq_pipeline_final/gtdbtk_db/release226")
-METADATA_FILE = config.get("metadata", f"{BASE_DIR}/gapseq_pipeline_final/metadata.csv")
+# Extract unique sample IDs from all media columns
+media_cols = ["Taurine", "Creatinine", "Carnitine", "Xylan", "Chitin"]
+for col in media_cols:
+    if col in metadata.columns:
+        samples = metadata[col].dropna()
+        for s in samples:
+            s_str = str(s)
+            if s_str.endswith('.fa'):
+                if s_str not in FASTA_SAMPLES:
+                    FASTA_SAMPLES.append(s_str)
+            else:
+                # Handle float conversion (459.0 -> 459)
+                if '.' in s_str:
+                    s_str = str(int(float(s_str)))
+                if s_str not in FASTQ_SAMPLES:
+                    FASTQ_SAMPLES.append(s_str)
 
-# Get FASTA paths from config
-FASTA_PATHS = config.get("fasta_paths", {})
+print(f"Found {len(FASTQ_SAMPLES)} FASTQ samples: {FASTQ_SAMPLES}")
+print(f"Found {len(FASTA_SAMPLES)} FASTA samples: {FASTA_SAMPLES}")
 
-# Output directories
-RESULTS_DIR = config.get("results_dir", "results")
-TRIMMED_DIR = f"{RESULTS_DIR}/01_trimmed"
-ASSEMBLY_DIR = f"{RESULTS_DIR}/02_assembly"
-QC_DIR = f"{RESULTS_DIR}/03_qc"
-BINNING_DIR = f"{RESULTS_DIR}/04_binning"
-BINS_DIR = f"{RESULTS_DIR}/05_bins"
-CHECKM_DIR = f"{RESULTS_DIR}/06_checkm"
-GTDBTK_DIR = f"{RESULTS_DIR}/07_gtdbtk"
-PRODIGAL_DIR = f"{RESULTS_DIR}/08_prodigal"
-GAPSEQ_DIR = f"{RESULTS_DIR}/09_gapseq"
-FINAL_QC_DIR = f"{RESULTS_DIR}/10_final_qc"
-
-# Parse metadata to get sample-media mapping
-metadata_df = pd.read_csv(METADATA_FILE)
-SAMPLE_MEDIA = {}
-MEDIA_TYPES = ["Taurine", "Creatinine", "Carnitine", "Xylan", "Chitin"]
-
-# Build sample-media mapping from metadata
-for media in MEDIA_TYPES:
-    if media in metadata_df.columns:
-        samples = metadata_df[media].dropna().tolist()
-        for sample in samples:
-            if str(sample).endswith('.fa') or str(sample).endswith('.fasta'):
-                # This is a pre-assembled genome
-                SAMPLE_MEDIA[sample] = media
-            elif str(sample).isdigit():
-                # This is a fastq sample ID
-                SAMPLE_MEDIA[sample] = media
-
-# Get all fastq samples and fasta samples
-FASTQ_SAMPLES = [s for s in SAMPLE_MEDIA.keys() if str(s).isdigit()]
-FASTA_SAMPLES = [s for s in SAMPLE_MEDIA.keys() if s.endswith(('.fa', '.fasta'))]
-
-# For binned samples, we'll create a wildcard for bins
-# This will be dynamically determined after binning
-
-# Containers
-CONTAINERS = {
-    "trimgalore": f"{SINGULARITY_DIR}/quay.io-biocontainers-trim-galore-0.6.10--hdfd78af_0.img",
-    "spades": f"{SINGULARITY_DIR}/quay.io-biocontainers-spades-3.15.5--h95f258a_0.img",
-    "bwa": f"{SINGULARITY_DIR}/bwa_0.7.17--hed695b0_7.sif",
-    "samtools": f"{SINGULARITY_DIR}/samtools_1.16.1--h6899075_1.sif",
-    "quast": f"{SINGULARITY_DIR}/quay.io-biocontainers-quast-5.2.0--py39pl5321h2add14b_1.img",
-    "concoct": f"{SINGULARITY_DIR}/concoct_1.1.0--py312h71dcd68_7.sif",
-    "checkm": f"{SINGULARITY_DIR}/checkm-genome_1.2.4--pyhdfd78af_2.sif",
-    "gtdbtk": f"{SINGULARITY_DIR}/quay.io-biocontainers-gtdbtk-2.4.1--pyhdfd78af_1.img",
-    "prodigal": f"{SINGULARITY_DIR}/prodigal_2.6.3--h779adbc_3.sif",
-    "gapseq": f"{SINGULARITY_DIR}/quay.io-biocontainers-gapseq-1.4.0--h9ee0642_1.img",
-    "multiqc": f"{SINGULARITY_DIR}/quay.io-biocontainers-multiqc-1.13--pyhdfd78af_0.img"
-}
-
-# Default rule
+# Rule all - what we want to produce
 rule all:
     input:
-        # Assembly QC for FASTQ samples
-        expand(f"{QC_DIR}/assembly/{{sample}}/report.txt", sample=FASTQ_SAMPLES),
-        # Binning checkpoint for FASTQ samples
-        expand(f"{BINNING_DIR}/{{sample}}/bins_completed.txt", sample=FASTQ_SAMPLES),
-        # CheckM for bins
-        expand(f"{CHECKM_DIR}/{{sample}}/checkm_results.txt", sample=FASTQ_SAMPLES),
-        # Batch GTDB-Tk for ALL genomes (MAGs + FASTA)
-        f"{GTDBTK_DIR}/batch_results_parsed.txt",
-        # For each FASTQ sample, process all bins
-        expand(f"{BINS_DIR}/{{sample}}/all_bins_processed.txt", sample=FASTQ_SAMPLES),
-        # For FASTA samples, process directly (no GTDB-Tk here since it's in batch)
-        expand(f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}.RDS", sample=FASTA_SAMPLES),
-        # Final QC report
-        f"{FINAL_QC_DIR}/final_report.html"
+        expand(f"{RESULTS_DIR}/01_trimmed/{{sample}}_R1_001_val_1.fq.gz", sample=FASTQ_SAMPLES),
+        expand(f"{RESULTS_DIR}/01_trimmed/{{sample}}_R2_001_val_2.fq.gz", sample=FASTQ_SAMPLES),
+        expand(f"{RESULTS_DIR}/02_assembly/{{sample}}/contigs.fasta", sample=FASTQ_SAMPLES),
+        expand(f"{RESULTS_DIR}/03_mapping/{{sample}}/{{sample}}.sorted.bam", sample=FASTQ_SAMPLES),
+        expand(f"{RESULTS_DIR}/04_binning/{{sample}}/bins/done.txt", sample=FASTQ_SAMPLES),
+        expand(f"{RESULTS_DIR}/05_checkm/{{sample}}/checkm_results.txt", sample=FASTQ_SAMPLES),
+        expand(f"{RESULTS_DIR}/06_good_bins/{{sample}}/done.txt", sample=FASTQ_SAMPLES),
+        f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/collected.txt",
+        f"{RESULTS_DIR}/08_gtdbtk/done.txt",
+        f"{RESULTS_DIR}/12_gapseq_models/multi_media_complete.txt"
 
-# ================== MODULE 1: Quality Control and Trimming ==================
-
+# Rule 1: Trim reads with Trim-Galore
 rule trim_reads:
-    """
-    Trim raw reads using Trim-Galore
-    """
     input:
         r1 = f"{DATA_DIR}/{{sample}}_R1_001.fastq.gz",
         r2 = f"{DATA_DIR}/{{sample}}_R2_001.fastq.gz"
     output:
-        r1 = f"{TRIMMED_DIR}/{{sample}}_R1_001_val_1.fq.gz",  
-        r2 = f"{TRIMMED_DIR}/{{sample}}_R2_001_val_2.fq.gz",  
-        report1 = f"{TRIMMED_DIR}/{{sample}}_R1_001.fastq.gz_trimming_report.txt",
-        report2 = f"{TRIMMED_DIR}/{{sample}}_R2_001.fastq.gz_trimming_report.txt"
+        r1 = f"{RESULTS_DIR}/01_trimmed/{{sample}}_R1_001_val_1.fq.gz",
+        r2 = f"{RESULTS_DIR}/01_trimmed/{{sample}}_R2_001_val_2.fq.gz"
     params:
-        quality = config.get("trim_quality", 20),
-        min_length = config.get("trim_min_length", 50)
-    threads: 1
-    container: CONTAINERS["trimgalore"]
+        outdir = f"{RESULTS_DIR}/01_trimmed"
+    threads: 4
+    container: f"{SINGULARITY_DIR}/quay.io-biocontainers-trim-galore-0.6.10--hdfd78af_0.img"
     shell:
         """
+        mkdir -p {params.outdir}
+        
         trim_galore \
-            --quality {params.quality} \
-            --length {params.min_length} \
+            --quality 20 \
+            --length 50 \
             --paired \
             --gzip \
             --cores {threads} \
-            --output_dir {TRIMMED_DIR} \
+            --output_dir {params.outdir} \
             {input.r1} {input.r2}
         """
-# ================== MODULE 2: Assembly ==================
 
-rule assemble_reads:
-    """
-    Assemble trimmed reads using SPAdes
-    """
+# Rule 2: Assemble with SPAdes
+rule assemble_spades:
     input:
-        r1 = f"{TRIMMED_DIR}/{{sample}}_R1_001_val_1.fq.gz",
-        r2 = f"{TRIMMED_DIR}/{{sample}}_R2_001_val_2.fq.gz"
+        r1 = f"{RESULTS_DIR}/01_trimmed/{{sample}}_R1_001_val_1.fq.gz",
+        r2 = f"{RESULTS_DIR}/01_trimmed/{{sample}}_R2_001_val_2.fq.gz"
     output:
-        contigs = f"{ASSEMBLY_DIR}/{{sample}}/contigs.fasta",
-        scaffolds = f"{ASSEMBLY_DIR}/{{sample}}/scaffolds.fasta"
+        contigs = f"{RESULTS_DIR}/02_assembly/{{sample}}/contigs.fasta",
+        scaffolds = f"{RESULTS_DIR}/02_assembly/{{sample}}/scaffolds.fasta"
     params:
-        outdir = f"{ASSEMBLY_DIR}/{{sample}}",
-        kmers = config.get("spades_kmers", "21,33,55,77")
-    threads: 1
-    resources:
-        mem_mb=120000,
-        time="24:00:00",
-        assembly=1
-    container: CONTAINERS["spades"]
+        outdir = f"{RESULTS_DIR}/02_assembly/{{sample}}"
+    threads: 16
+    container: f"{SINGULARITY_DIR}/quay.io-biocontainers-spades-3.15.5--h95f258a_0.img"
     shell:
         """
         spades.py \
@@ -150,745 +90,559 @@ rule assemble_reads:
             -1 {input.r1} \
             -2 {input.r2} \
             -o {params.outdir} \
-            -k {params.kmers} \
+            -k 21,33,55,77 \
             -t {threads} \
+            -m 120
         """
 
-# ================== MODULE 3: Assembly QC ==================
-
-rule quast_assembly:
-    """
-    Quality assessment of assemblies using QUAST
-    """
+# Rule 3: Map reads to assembly for binning
+rule map_reads:
     input:
-        contigs = rules.assemble_reads.output.contigs
+        contigs = f"{RESULTS_DIR}/02_assembly/{{sample}}/contigs.fasta",
+        r1 = f"{RESULTS_DIR}/01_trimmed/{{sample}}_R1_001_val_1.fq.gz",
+        r2 = f"{RESULTS_DIR}/01_trimmed/{{sample}}_R2_001_val_2.fq.gz"
     output:
-        report = f"{QC_DIR}/assembly/{{sample}}/report.txt"
+        bam = f"{RESULTS_DIR}/03_mapping/{{sample}}/{{sample}}.sorted.bam",
+        bai = f"{RESULTS_DIR}/03_mapping/{{sample}}/{{sample}}.sorted.bam.bai"
     params:
-        outdir = f"{QC_DIR}/assembly/{{sample}}"
-    threads: 1
-    container: CONTAINERS["quast"]
+        outdir = f"{RESULTS_DIR}/03_mapping/{{sample}}",
+        bwa_container = f"{SINGULARITY_DIR}/bwa_0.7.17--hed695b0_7.sif",
+        samtools_container = f"{SINGULARITY_DIR}/samtools_1.16.1--h6899075_1.sif"
+    threads: 8
     shell:
         """
-        quast.py \
-            {input.contigs} \
-            -o {params.outdir} \
-            --threads {threads} \
-            --min-contig 500
-        """
-
-# ================== MODULE 4: Read Mapping for Binning ==================
-
-rule map_reads_to_assembly:
-    """
-    Map reads back to assembly for coverage calculation
-    """
-    input:
-        contigs = rules.assemble_reads.output.contigs,
-        r1 = f"{TRIMMED_DIR}/{{sample}}_R1_001_val_1.fq.gz",
-        r2 = f"{TRIMMED_DIR}/{{sample}}_R2_001_val_2.fq.gz"
-    output:
-        bam = f"{BINNING_DIR}/{{sample}}/{{sample}}_mapped.sorted.bam",
-        bai = f"{BINNING_DIR}/{{sample}}/{{sample}}_mapped.sorted.bam.bai"
-    threads: 1
-    shell:
-        """
-        # Index contigs
-        singularity exec {CONTAINERS[bwa]} bwa index {input.contigs}
+        mkdir -p {params.outdir}
         
-        # Map reads and pipe to samtools
-        singularity exec {CONTAINERS[bwa]} bwa mem -t {threads} {input.contigs} {input.r1} {input.r2} | \
-        singularity exec {CONTAINERS[samtools]} samtools sort -@ {threads} -o {output.bam}
+        # Index contigs
+        singularity exec {params.bwa_container} \
+            bwa index {input.contigs}
+        
+        # Map reads
+        singularity exec {params.bwa_container} \
+            bwa mem -t {threads} {input.contigs} {input.r1} {input.r2} | \
+        singularity exec {params.samtools_container} \
+            samtools sort -@ {threads} -o {output.bam}
         
         # Index BAM
-        singularity exec {CONTAINERS[samtools]} samtools index -@ {threads} {output.bam}
+        singularity exec {params.samtools_container} \
+            samtools index -@ {threads} {output.bam}
         """
 
-rule calculate_coverage:
-    """
-    Calculate coverage depth for binning using CONCOCT's proper tools
-    """
-    input:
-        contigs = rules.assemble_reads.output.contigs,
-        bam = rules.map_reads_to_assembly.output.bam
-    output:
-        coverage = f"{BINNING_DIR}/{{sample}}/coverage_table.tsv"
-    params:
-        outdir = f"{BINNING_DIR}/{{sample}}"
-    threads: 1
-    container: CONTAINERS["concoct"]  # Container BEFORE shell
-    shell:
-        """
-        # First cut up the contigs and create BED file
-        cut_up_fasta.py \
-            {input.contigs} \
-            -c 10000 -o 0 \
-            --merge_last \
-            -b {params.outdir}/contigs_10K.bed \
-            > {params.outdir}/contigs_10K.fa
-        
-        # Then use CONCOCT's coverage table tool with BED and BAM
-        concoct_coverage_table.py \
-            {params.outdir}/contigs_10K.bed \
-            {input.bam} \
-            > {output.coverage}
-        """
-# ================== MODULE 5: Binning ==================
+# Rule 4: Binning with CONCOCT
 rule binning_concoct:
-    """
-    Bin contigs using CONCOCT
-    """
     input:
-        contigs = rules.assemble_reads.output.contigs,
-        coverage = rules.calculate_coverage.output.coverage
+        contigs = f"{RESULTS_DIR}/02_assembly/{{sample}}/contigs.fasta",
+        bam = f"{RESULTS_DIR}/03_mapping/{{sample}}/{{sample}}.sorted.bam"
     output:
-        bins_dir = directory(f"{BINNING_DIR}/{{sample}}/bins"),
-        clustering = f"{BINNING_DIR}/{{sample}}/concoct_clustering.csv",
-        completed = f"{BINNING_DIR}/{{sample}}/bins_completed.txt"
+        done = f"{RESULTS_DIR}/04_binning/{{sample}}/bins/done.txt"
     params:
-        outdir = f"{BINNING_DIR}/{{sample}}"
-    threads: 1
-    resources:
-        mem_mb=32000,
-        time="12:00:00",
-        binning=1
-    container: CONTAINERS["concoct"]  # Container BEFORE shell
-    shell:
-        """
-        # Create output directories
-        mkdir -p {params.outdir}/concoct_output
-        mkdir -p {output.bins_dir}
-        
-        # The cut contigs and bed file already exist from calculate_coverage rule
-        CUT_CONTIGS={params.outdir}/contigs_10K.fa
-        
-        # Check if we have enough contigs
-        if [ -f "$CUT_CONTIGS" ]; then
-            NUM_CONTIGS=$(grep -c "^>" $CUT_CONTIGS 2>/dev/null || echo "0")
-        else
-            NUM_CONTIGS=0
-        fi
-        
-        echo "Cut contigs: $NUM_CONTIGS"
-        
-        if [ "$NUM_CONTIGS" -lt 4 ]; then
-            echo "Too few contigs for binning"
-            echo "contig_id,cluster_id" > {output.clustering}
-            echo "no_bins_found" > {output.completed}
-        else
-            # Run CONCOCT
-            concoct \
-                --composition_file $CUT_CONTIGS \
-                --coverage_file {input.coverage} \
-                -b {params.outdir}/concoct_output/ \
-                -t {threads} \
-                --iterations 500 \
-                --seed 42 || true
-            
-            # Process results if successful
-            if [ -f {params.outdir}/concoct_output/clustering_gt1000.csv ]; then
-                # Merge clustering
-                merge_cutup_clustering.py \
-                    {params.outdir}/concoct_output/clustering_gt1000.csv \
-                    > {output.clustering}
-                
-                # Extract bins
-                extract_fasta_bins.py \
-                    {input.contigs} \
-                    {output.clustering} \
-                    --output_path {output.bins_dir}
-                
-                # List bins
-                ls {output.bins_dir}/*.fa > {output.completed} 2>/dev/null || echo "no_bins_found" > {output.completed}
-            else
-                echo "CONCOCT produced no clustering"
-                echo "contig_id,cluster_id" > {output.clustering}
-                echo "no_bins_found" > {output.completed}
-            fi
-        fi
-        
-        # Ensure outputs exist
-        touch {output.clustering}
-        touch {output.completed}
-        """
-
-
-# ================== MODULE 6: Initial Bin Quality Check ==================
-# Fixed CheckM rule with correct column parsing and no bc dependency
-
-rule checkm_bins:
-    """
-    Check quality of bins using CheckM and filter based on completeness/contamination
-    Fixed: correct column numbers and no bc command
-    """
-    input:
-        bins_dir = rules.binning_concoct.output.bins_dir,
-        completed = rules.binning_concoct.output.completed
-    output:
-        results = f"{CHECKM_DIR}/{{sample}}/checkm_results.txt",
-        filtered_bins = f"{CHECKM_DIR}/{{sample}}/good_bins.txt"
-    params:
-        outdir = f"{CHECKM_DIR}/{{sample}}",
-        completeness = config.get("checkm_completeness_threshold", 50),
-        contamination = config.get("checkm_contamination_threshold", 10)
+        outdir = f"{RESULTS_DIR}/04_binning/{{sample}}",
+        concoct_container = f"{SINGULARITY_DIR}/concoct_1.1.0--py312h71dcd68_7.sif"
     threads: 8
-    container: CONTAINERS["checkm"]
     shell:
         """
-        # Check if we have any bins
-        if grep -q "\.fa$" {input.completed}; then
-            # Run CheckM lineage workflow
+        mkdir -p {params.outdir}/bins
+        
+        # Cut up contigs
+        singularity exec {params.concoct_container} \
+            cut_up_fasta.py {input.contigs} -c 10000 -o 0 --merge_last \
+            -b {params.outdir}/contigs_10K.bed > {params.outdir}/contigs_10K.fa
+        
+        # Generate coverage table
+        singularity exec {params.concoct_container} \
+            concoct_coverage_table.py {params.outdir}/contigs_10K.bed \
+            {input.bam} > {params.outdir}/coverage_table.tsv
+        
+        # Run CONCOCT
+        singularity exec {params.concoct_container} \
+            concoct --composition_file {params.outdir}/contigs_10K.fa \
+            --coverage_file {params.outdir}/coverage_table.tsv \
+            -b {params.outdir}/ \
+            -t {threads}
+        
+        # Merge clustering results
+        singularity exec {params.concoct_container} \
+            merge_cutup_clustering.py {params.outdir}/clustering_gt1000.csv \
+            > {params.outdir}/clustering_merged.csv
+        
+        # Extract bins
+        singularity exec {params.concoct_container} \
+            extract_fasta_bins.py {input.contigs} \
+            {params.outdir}/clustering_merged.csv \
+            --output_path {params.outdir}/bins
+        
+        touch {output.done}
+        """
+
+# Rule 5: CheckM quality assessment
+rule checkm_bins:
+    input:
+        done = f"{RESULTS_DIR}/04_binning/{{sample}}/bins/done.txt"
+    output:
+        results = f"{RESULTS_DIR}/05_checkm/{{sample}}/checkm_results.txt",
+        table = f"{RESULTS_DIR}/05_checkm/{{sample}}/checkm_table.tsv"
+    params:
+        bins_dir = f"{RESULTS_DIR}/04_binning/{{sample}}/bins",
+        outdir = f"{RESULTS_DIR}/05_checkm/{{sample}}",
+        checkm_container = f"{SINGULARITY_DIR}/checkm-genome_1.2.4--pyhdfd78af_2.sif"
+    threads: 8
+    shell:
+        """
+        # Run CheckM lineage workflow
+        singularity exec {params.checkm_container} \
             checkm lineage_wf \
-                -t {threads} \
-                -x fa \
-                {input.bins_dir} \
-                {params.outdir} \
-                > {output.results}
-            
-            # Create quality assessment table
+            -t {threads} \
+            -x fa \
+            {params.bins_dir} \
+            {params.outdir} \
+            > {output.results}
+        
+        # Generate table output
+        singularity exec {params.checkm_container} \
             checkm qa \
-                -o 2 \
-                -f {params.outdir}/checkm_table.tsv \
-                --tab_table \
-                {params.outdir}/lineage.ms \
-                {params.outdir}
-            
-            # Filter bins based on quality thresholds
-            echo "Filtering bins with thresholds: Completeness>={params.completeness}%, Contamination<={params.contamination}%"
-            
-            # Parse CheckM table with CORRECT columns (6=completeness, 7=contamination)
-            > {output.filtered_bins}
-            tail -n +2 {params.outdir}/checkm_table.tsv | while IFS=$'\t' read -r bin_id col2 col3 col4 col5 completeness contamination rest; do
-                
-                # Use awk for floating point comparison (bc not available)
-                PASS=$(awk -v comp="$completeness" -v cont="$contamination" -v min_comp="{params.completeness}" -v max_cont="{params.contamination}" \
-                       'BEGIN {{if(comp >= min_comp && cont <= max_cont) print "YES"; else print "NO"}}')
-                
-                if [ "$PASS" == "YES" ]; then
-                    echo "$bin_id" >> {output.filtered_bins}
-                    echo "  ✓ PASS: $bin_id (C:${{completeness}}%, Cont:${{contamination}}%)"
-                else
-                    echo "  ✗ FAIL: $bin_id (C:${{completeness}}%, Cont:${{contamination}}%)"
-                fi
-            done
-            
-            # Report summary
-            TOTAL_BINS=$(ls {input.bins_dir}/*.fa 2>/dev/null | wc -l)
-            GOOD_BINS=$(cat {output.filtered_bins} 2>/dev/null | wc -l)
-            echo ""
-            echo "CheckM Summary for {wildcards.sample}:"
-            echo "  Total bins: $TOTAL_BINS"
-            echo "  Passed QC: $GOOD_BINS"
-            echo "  Failed QC: $((TOTAL_BINS - GOOD_BINS))"
-            
-            # If no bins pass, suggest processing whole assembly
-            if [ "$GOOD_BINS" -eq 0 ]; then
-                echo ""
-                echo "  No bins passed quality thresholds for {wildcards.sample}"
-                echo "  Consider processing the whole assembly as a single genome"
-            fi
-            
-        else
-            echo "No bins found for {wildcards.sample}" > {output.results}
-            touch {output.filtered_bins}
-        fi
-        """
-# ================== MODULE 7: Process Individual Bins (Parallel) ==================
-
-checkpoint get_bins:
-    """
-    Get list of bins for a sample to process - handles no bins gracefully
-    """
-    input:
-        bins_dir = f"{BINNING_DIR}/{{sample}}/bins",
-        filtered = f"{CHECKM_DIR}/{{sample}}/good_bins.txt"
-    output:
-        bins_list = f"{BINS_DIR}/{{sample}}/bins_to_process.txt"
-    shell:
-        """
-        mkdir -p {BINS_DIR}/{wildcards.sample}
-        
-        # Check if we have any good quality bins
-        if [ -s {input.filtered} ]; then
-            # Process good quality bins
-            for bin_id in $(cat {input.filtered}); do
-                if [ -f {input.bins_dir}/${{bin_id}}.fa ]; then
-                    echo "${{bin_id}}" >> {output.bins_list}
-                    cp {input.bins_dir}/${{bin_id}}.fa {BINS_DIR}/{wildcards.sample}/
-                fi
-            done
-        fi
-        
-        # If no bins were found, create a marker
-        if [ ! -s {output.bins_list} ]; then
-            echo "no_bins_found" > {output.bins_list}
-        fi
+            -o 2 \
+            -f {output.table} \
+            --tab_table \
+            {params.outdir}/lineage.ms \
+            {params.outdir}
         """
 
-# Batch GTDB-Tk for all samples
-rule prepare_gtdbtk_batch:
-    """
-    Prepare all genomes for batch GTDB-Tk processing - fixed version
-    """
+# Rule 6: Filter bins >90% completeness
+rule filter_good_bins:
     input:
-        # Make bins_lists optional - don't wait for all samples
-        bins_lists = expand(f"{BINS_DIR}/{{sample}}/bins_to_process.txt", 
-                          sample=FASTQ_SAMPLES),
-        # Include FASTA samples
-        fasta_files = [FASTA_PATHS.get(s, f"{INPUT_DIR}/{s}") for s in FASTA_SAMPLES]
+        checkm_table = f"{RESULTS_DIR}/05_checkm/{{sample}}/checkm_table.tsv"
     output:
-        genome_dir = directory(f"{GTDBTK_DIR}/batch_genomes"),
-        genome_list = f"{GTDBTK_DIR}/batch_genomes_list.txt"
+        done = f"{RESULTS_DIR}/06_good_bins/{{sample}}/done.txt",
+        summary = f"{RESULTS_DIR}/06_good_bins/{{sample}}/summary.txt"
+    params:
+        bins_dir = f"{RESULTS_DIR}/04_binning/{{sample}}/bins",
+        good_bins_dir = f"{RESULTS_DIR}/06_good_bins/{{sample}}",
+        completeness_threshold = 90
     run:
         import os
         import shutil
         
-        # Create directory for all genomes
-        os.makedirs(output.genome_dir, exist_ok=True)
-        genome_paths = []
+        # Create output directory
+        os.makedirs(params.good_bins_dir, exist_ok=True)
         
-        # Copy all MAG bins that exist
+        good_bins = []
+        total_bins = 0
+        
+        # Parse CheckM table
+        with open(input.checkm_table, 'r') as f:
+            lines = f.readlines()
+            
+        # Skip header line
+        for line in lines[1:]:
+            if line.strip():
+                parts = line.strip().split('\t')
+                if len(parts) >= 7:
+                    bin_id = parts[0]
+                    completeness = float(parts[5])
+                    contamination = float(parts[6])
+                    
+                    total_bins += 1
+                    
+                    # Check if completeness > threshold
+                    if completeness > params.completeness_threshold:
+                        # Try to copy the bin file
+                        src_fa = f"{params.bins_dir}/{bin_id}.fa"
+                        src_fasta = f"{params.bins_dir}/{bin_id}.fasta"
+                        dst = f"{params.good_bins_dir}/{bin_id}.fa"
+                        
+                        if os.path.exists(src_fa):
+                            shutil.copy(src_fa, dst)
+                            good_bins.append(f"{bin_id}: Completeness={completeness:.1f}%, Contamination={contamination:.1f}%")
+                        elif os.path.exists(src_fasta):
+                            shutil.copy(src_fasta, dst)
+                            good_bins.append(f"{bin_id}: Completeness={completeness:.1f}%, Contamination={contamination:.1f}%")
+        
+        # Write summary
+        with open(output.summary, 'w') as f:
+            for bin_info in good_bins:
+                f.write(f"{bin_info}\n")
+            f.write(f"\nTotal bins: {total_bins}\n")
+            f.write(f"Good bins (>90% complete): {len(good_bins)}\n")
+        
+        # Create done file
+        with open(output.done, 'w') as f:
+            f.write("Filtering complete\n")
+
+# Rule 7: Collect all genomes for GTDB-Tk
+rule collect_all_genomes:
+    input:
+        good_bins_done = expand(f"{RESULTS_DIR}/06_good_bins/{{sample}}/done.txt", sample=FASTQ_SAMPLES)
+    output:
+        collected = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/collected.txt",
+        summary = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/genome_list.txt"
+    params:
+        good_bins_dirs = expand(f"{RESULTS_DIR}/06_good_bins/{{sample}}", sample=FASTQ_SAMPLES),
+        output_dir = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk",
+        input_dir = "input"
+    run:
+        import os
+        import shutil
+        import glob
+        
+        # Create output directory
+        os.makedirs(params.output_dir, exist_ok=True)
+        
+        genome_list = []
+        
+        # Collect all good bins from FASTQ samples
         for sample in FASTQ_SAMPLES:
-            # Check both 05_bins and 04_binning for bins
-            bins_processed = False
-            
-            # Try 05_bins first (quality filtered)
-            bins_dir_filtered = f"{BINS_DIR}/{sample}"
-            if os.path.exists(bins_dir_filtered):
-                for bin_file in glob.glob(f"{bins_dir_filtered}/*.fa"):
+            bins_dir = f"{RESULTS_DIR}/06_good_bins/{sample}"
+            if os.path.exists(bins_dir):
+                for bin_file in glob.glob(f"{bins_dir}/*.fa") + glob.glob(f"{bins_dir}/*.fasta"):
                     if os.path.exists(bin_file):
-                        bin_id = os.path.basename(bin_file).replace('.fa', '')
-                        dst = f"{output.genome_dir}/{sample}_{bin_id}.fa"
+                        bin_name = os.path.basename(bin_file).replace('.fasta', '.fa')
+                        # Name format: sample_binID.fa
+                        new_name = f"{sample}_{bin_name}"
+                        dst = os.path.join(params.output_dir, new_name)
                         shutil.copy(bin_file, dst)
-                        genome_paths.append(dst)
-                        bins_processed = True
-            
-            # If no quality bins, check raw bins
-            if not bins_processed:
-                bins_dir_raw = f"{BINNING_DIR}/{sample}/bins"
-                if os.path.exists(bins_dir_raw):
-                    for bin_file in glob.glob(f"{bins_dir_raw}/*.fa"):
-                        if os.path.exists(bin_file):
-                            bin_id = os.path.basename(bin_file).replace('.fa', '')
-                            dst = f"{output.genome_dir}/{sample}_{bin_id}.fa"
-                            shutil.copy(bin_file, dst)
-                            genome_paths.append(dst)
+                        genome_list.append(f"{new_name}\tMAG\t{sample}")
+                        print(f"Copied {bin_name} from sample {sample}")
         
-        # Copy all FASTA samples
-        for fasta_file in input.fasta_files:
-            if os.path.exists(fasta_file):
-                basename = os.path.basename(fasta_file)
-                dst = f"{output.genome_dir}/{basename}"
-                shutil.copy(fasta_file, dst)
-                genome_paths.append(dst)
+        # Copy FASTA samples
+        for fasta in FASTA_SAMPLES:
+            src = os.path.join(params.input_dir, fasta)
+            if os.path.exists(src):
+                # Keep original name but ensure .fa extension
+                fasta_name = fasta if fasta.endswith('.fa') else fasta.replace('.fasta', '.fa')
+                dst = os.path.join(params.output_dir, fasta_name)
+                shutil.copy(src, dst)
+                genome_list.append(f"{fasta_name}\tReference\tInput")
+                print(f"Copied reference genome {fasta}")
         
-        # Write list of all genomes
-        with open(output.genome_list, 'w') as f:
-            if genome_paths:
-                for path in genome_paths:
-                    f.write(f"{path}\n")
-            else:
-                f.write("# No genomes found\n")
+        # Write summary
+        with open(output.summary, 'w') as f:
+            f.write("Genome\tType\tSource\n")
+            for entry in genome_list:
+                f.write(f"{entry}\n")
         
-        print(f"Prepared {len(genome_paths)} genomes for GTDB-Tk")
+        # Write collected marker
+        with open(output.collected, 'w') as f:
+            f.write(f"Collected {len(genome_list)} genomes total\n")
+            mag_count = sum(1 for g in genome_list if "MAG" in g)
+            ref_count = sum(1 for g in genome_list if "Reference" in g)
+            f.write(f"  MAGs: {mag_count}\n")
+            f.write(f"  Reference genomes: {ref_count}\n")
 
-
-rule gtdbtk_classify_batch:
-    """
-    Batch taxonomic classification using GTDB-Tk for ALL genomes at once
-    """
+# Rule 8: GTDB-Tk classification for all genomes
+rule gtdbtk_classify:
     input:
-        genome_dir = rules.prepare_gtdbtk_batch.output.genome_dir,
-        genome_list = rules.prepare_gtdbtk_batch.output.genome_list
+        collected = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/collected.txt"
     output:
-        summary = f"{GTDBTK_DIR}/batch_results/gtdbtk.bac120.summary.tsv",
-        done = f"{GTDBTK_DIR}/batch_results/gtdbtk_complete.txt"
+        summary = f"{RESULTS_DIR}/08_gtdbtk/gtdbtk.bac120.summary.tsv",
+        done = f"{RESULTS_DIR}/08_gtdbtk/done.txt"
     params:
-        outdir = f"{GTDBTK_DIR}/batch_results",
-        db_path = GTDBTK_DB
-    threads: 10
-    resources:
-        mem_mb=128000,
-        time="24:00:00",
-        gtdbtk=1
-    container: CONTAINERS["gtdbtk"]
+        genome_dir = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk",
+        outdir = f"{RESULTS_DIR}/08_gtdbtk",
+        gtdbtk_db = "/lustre/BIF/nobackup/mulle088/gapseq_pipeline_final/gtdbtk_db/release226",
+        gtdbtk_container = f"{SINGULARITY_DIR}/quay.io-biocontainers-gtdbtk-2.4.1--pyhdfd78af_1.img"
+    threads: 40
     shell:
         """
-        export GTDBTK_DATA_PATH={params.db_path}
+        export GTDBTK_DATA_PATH={params.gtdbtk_db}
         
-        # Count genomes
-        NUM_GENOMES=$(ls {input.genome_dir}/*.fa 2>/dev/null | wc -l || echo "0")
-        echo "Processing $NUM_GENOMES genomes in batch mode"
-        
-        if [ "$NUM_GENOMES" -gt 0 ]; then
-            # Run GTDB-Tk WITHOUT the invalid --batch_file argument
+        # Run GTDB-Tk classify workflow
+        singularity exec -B {params.gtdbtk_db} {params.gtdbtk_container} \
             gtdbtk classify_wf \
-                --genome_dir {input.genome_dir} \
-                --extension fa \
-                --out_dir {params.outdir} \
-                --cpus {threads} \
-                --pplacer_cpus {threads} \
-                --skip_ani_screen
-            
-            echo "GTDB-Tk batch processing complete" > {output.done}
-        else
-            echo "No genomes to process" > {output.done}
-            touch {output.summary}
+            --genome_dir {params.genome_dir} \
+            --extension fa \
+            --out_dir {params.outdir} \
+            --cpus {threads} \
+            --skip_ani_screen \
+            --pplacer_cpus 20
+                    
+        touch {output.done}
+        """
+
+# Create checkpoint to get genome list dynamically
+checkpoint get_genome_list:
+    input:
+        collected = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/collected.txt"
+    output:
+        genome_list = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/genome_names.txt"
+    shell:
+        """
+        ls {RESULTS_DIR}/07_all_genomes_for_gtdbtk/*.fa | xargs -n1 basename | sed 's/.fa$//' > {output.genome_list}
+        """
+
+# Rule 9: Gapseq find pathways - SIMPLIFIED
+rule gapseq_pathways_single:
+    input:
+        genome = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/{{genome}}.fa"
+    output:
+        pathways = f"{RESULTS_DIR}/09_gapseq_pathways/{{genome}}-all-Pathways.tbl",
+        reactions = f"{RESULTS_DIR}/09_gapseq_pathways/{{genome}}-all-Reactions.tbl"
+    params:
+        outdir = f"{RESULTS_DIR}/09_gapseq_pathways",
+        gapseq_container = f"{SINGULARITY_DIR}/quay.io-biocontainers-gapseq-1.4.0--h9ee0642_1.img"
+    threads: 4
+    shell:
+        """
+        cd {params.outdir}
+        singularity exec {params.gapseq_container} \
+            gapseq find -p all ../../{input.genome}
+        """
+
+# Rule 10: Gapseq find transporters - SIMPLIFIED
+rule gapseq_transporters_single:
+    input:
+        genome = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/{{genome}}.fa"
+    output:
+        transporters = f"{RESULTS_DIR}/10_gapseq_transporters/{{genome}}-Transporter.tbl"
+    params:
+        outdir = f"{RESULTS_DIR}/10_gapseq_transporters",
+        gapseq_container = f"{SINGULARITY_DIR}/quay.io-biocontainers-gapseq-1.4.0--h9ee0642_1.img"
+    threads: 4
+    shell:
+        """
+        cd {params.outdir}
+        singularity exec {params.gapseq_container} \
+            gapseq find-transport ../../{input.genome}
+        """
+
+# Rule 11: Gapseq draft - SIMPLIFIED
+rule gapseq_draft_single:
+    input:
+        genome = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/{{genome}}.fa",
+        pathways = f"{RESULTS_DIR}/09_gapseq_pathways/{{genome}}-all-Pathways.tbl",
+        reactions = f"{RESULTS_DIR}/09_gapseq_pathways/{{genome}}-all-Reactions.tbl",
+        transporters = f"{RESULTS_DIR}/10_gapseq_transporters/{{genome}}-Transporter.tbl"
+    output:
+        draft = f"{RESULTS_DIR}/11_gapseq_draft/{{genome}}-draft.RDS"
+    params:
+        outdir = f"{RESULTS_DIR}/11_gapseq_draft",
+        gapseq_container = f"{SINGULARITY_DIR}/quay.io-biocontainers-gapseq-1.4.0--h9ee0642_1.img"
+    threads: 4
+    shell:
+        """
+        cd {params.outdir}
+        singularity exec {params.gapseq_container} \
+            gapseq draft \
+            -r ../../{input.reactions} \
+            -t ../../{input.transporters} \
+            -p ../../{input.pathways} \
+            -c ../../{input.genome}
+        """
+# Aggregate function using checkpoint
+def aggregate_gapseq_outputs(wildcards):
+    checkpoint_output = checkpoints.get_genome_list.get(**wildcards).output[0]
+    with open(checkpoint_output) as f:
+        genomes = [line.strip() for line in f if line.strip()]
+    
+    return {
+        'pathways': expand(f"{RESULTS_DIR}/09_gapseq_pathways/{{genome}}-all-Pathways.tbl", genome=genomes),
+        'transporters': expand(f"{RESULTS_DIR}/10_gapseq_transporters/{{genome}}-Transporter.tbl", genome=genomes),
+        'drafts': expand(f"{RESULTS_DIR}/11_gapseq_draft/{{genome}}-draft.RDS", genome=genomes)
+    }
+
+
+# Create a function to get all genome-media combinations
+def get_genome_media_combinations():
+    """
+    Parse metadata to get all genome-media combinations
+    Returns list of tuples: (genome, media)
+    """
+    metadata = pd.read_csv("input/meta_input_pipeline.csv")
+    combinations = []
+    
+    for media in ["Taurine", "Creatinine", "Carnitine", "Xylan", "Chitin"]:
+        if media in metadata.columns:
+            samples = metadata[media].dropna().tolist()
+            for sample in samples:
+                sample_str = str(sample)
+                
+                # Handle FASTA samples
+                if sample_str.endswith('.fa'):
+                    combinations.append(("Marinacidobacteraceae", media))
+                # Handle FASTQ samples (MAGs)
+                else:
+                    if '.' in sample_str:
+                        sample_str = str(int(float(sample_str)))
+                    
+                    # Get all bins for this sample from the genome directory
+                    genome_dir = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk"
+                    if os.path.exists(genome_dir):
+                        # Look for all genomes starting with this sample ID
+                        for genome_file in glob.glob(f"{genome_dir}/{sample_str}_*.fa"):
+                            genome_name = os.path.basename(genome_file).replace('.fa', '')
+                            combinations.append((genome_name, media))
+    
+    return combinations
+
+# Get all combinations
+GENOME_MEDIA_COMBINATIONS = get_genome_media_combinations()
+
+rule gapseq_fill_multi_media:
+    input:
+        draft = f"{RESULTS_DIR}/11_gapseq_draft/{{genome}}-draft.RDS",
+        weights = f"{RESULTS_DIR}/11_gapseq_draft/{{genome}}-rxnWeights.RDS",
+        genes = f"{RESULTS_DIR}/11_gapseq_draft/{{genome}}-rxnXgenes.RDS",
+        media = "/lustre/BIF/nobackup/mulle088/snakemake/media/{media}_media.csv"
+    output:
+        model = f"{RESULTS_DIR}/12_gapseq_models/{{genome}}_{{media}}.RDS"
+    params:
+        outdir = f"{RESULTS_DIR}/12_gapseq_models",
+        gapseq_container = f"{SINGULARITY_DIR}/quay.io-biocontainers-gapseq-1.4.0--h9ee0642_1.img"
+    threads: 4
+    shell:
+        """
+        cd {params.outdir}
+        
+        # Run gapseq fill (it will create {wildcards.genome}.RDS)
+        singularity exec {params.gapseq_container} \
+            gapseq fill \
+            -m ../../{input.draft} \
+            -c ../../{input.weights} \
+            -g ../../{input.genes} \
+            -n {input.media} \
+            -o {wildcards.genome}_temp_{wildcards.media}
+        
+        # Rename the output to include media name
+        if [ -f "{wildcards.genome}_temp_{wildcards.media}.RDS" ]; then
+            mv {wildcards.genome}_temp_{wildcards.media}.RDS {wildcards.genome}_{wildcards.media}.RDS
+        elif [ -f "{wildcards.genome}.RDS" ]; then
+            mv {wildcards.genome}.RDS {wildcards.genome}_{wildcards.media}.RDS
+        fi
+        
+        # Also handle the XML file if created
+        if [ -f "{wildcards.genome}_temp_{wildcards.media}.xml" ]; then
+            mv {wildcards.genome}_temp_{wildcards.media}.xml {wildcards.genome}_{wildcards.media}.xml
+        elif [ -f "{wildcards.genome}.xml" ]; then
+            mv {wildcards.genome}.xml {wildcards.genome}_{wildcards.media}.xml
         fi
         """
-# Parse batch results back to individual samples
-rule parse_gtdbtk_results:
-    """
-    Parse batch GTDB-Tk results and distribute to individual genome folders
-    """
-    input:
-        summary = rules.gtdbtk_classify_batch.output.summary,
-        done = rules.gtdbtk_classify_batch.output.done
-    output:
-        parsed = f"{GTDBTK_DIR}/batch_results_parsed.txt"
-    run:
-        import pandas as pd
-        import os
-        import shutil
-        
-        # Read the batch results
-        if os.path.exists(input.summary) and os.path.getsize(input.summary) > 0:
-            df = pd.read_csv(input.summary, sep='\t')
-            
-            # Parse and copy results to individual directories
-            for _, row in df.iterrows():
-                genome_id = row['user_genome']
-                
-                # Determine if it's a bin or FASTA sample
-                if '_' in genome_id and genome_id.split('_')[0] in FASTQ_SAMPLES:
-                    # It's a bin from a FASTQ sample
-                    sample = genome_id.split('_')[0]
-                    bin_id = '_'.join(genome_id.split('_')[1:]).replace('.fa', '')
-                    
-                    # Create directory and copy result
-                    outdir = f"{GTDBTK_DIR}/bins/{sample}/{bin_id}"
-                    os.makedirs(outdir, exist_ok=True)
-                    
-                    # Create individual summary file
-                    row.to_frame().T.to_csv(
-                        f"{outdir}/gtdbtk.bac120.summary.tsv",
-                        sep='\t', index=False
-                    )
-                else:
-                    # It's a FASTA sample
-                    sample = genome_id.replace('.fa', '').replace('.fasta', '')
-                    
-                    # Create directory and copy result
-                    outdir = f"{GTDBTK_DIR}/fasta/{sample}"
-                    os.makedirs(outdir, exist_ok=True)
-                    
-                    # Create individual summary file
-                    row.to_frame().T.to_csv(
-                        f"{outdir}/gtdbtk.bac120.summary.tsv",
-                        sep='\t', index=False
-                    )
-        
-        with open(output.parsed, 'w') as f:
-            f.write("Batch GTDB-Tk results parsed and distributed\n")
 
-# Individual rules for other analyses (Prodigal, Gapseq) remain the same but without individual GTDB-Tk
-
-rule prodigal_genes_bin:
+def get_all_genome_media_models(wildcards):
     """
-    Predict genes in individual bin using Prodigal
+    Dynamically determine all genome-media combinations that should exist
     """
-    input:
-        bin = f"{BINS_DIR}/{{sample}}/{{bin_id}}.fa"
-    output:
-        proteins = f"{PRODIGAL_DIR}/bins/{{sample}}/{{bin_id}}/proteins.faa",
-        genes = f"{PRODIGAL_DIR}/bins/{{sample}}/{{bin_id}}/genes.fna",
-        gff = f"{PRODIGAL_DIR}/bins/{{sample}}/{{bin_id}}/genes.gff"
-    resources:
-        mem_mb=4000,
-        time="02:00:00",
-        mag_analysis=1
-    container: CONTAINERS["prodigal"]
-    shell:
-        """
-        prodigal \
-            -i {input.bin} \
-            -a {output.proteins} \
-            -d {output.genes} \
-            -f gff \
-            -o {output.gff} \
-        """
-
-rule gapseq_find_pathways_bin:
-    """
-    Find metabolic pathways in individual bin
-    """
-    input:
-        bin = f"{BINS_DIR}/{{sample}}/{{bin_id}}.fa"
-    output:
-        pathways = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-all-Pathways.tbl",
-        reactions = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-all-Reactions.tbl"
-    params:
-        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
-    threads: 1
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq find -p all {input.bin}
-        """
-
-rule gapseq_find_transport_bin:
-    """
-    Find transporters in individual bin
-    """
-    input:
-        bin = f"{BINS_DIR}/{{sample}}/{{bin_id}}.fa"
-    output:
-        transport = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-Transporter.tbl"
-    params:
-        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
-    threads: 1
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq find-transport {input.bin}
-        """
-
-rule gapseq_draft_bin:
-    """
-    Create draft metabolic model for individual bin
-    """
-    input:
-        bin = f"{BINS_DIR}/{{sample}}/{{bin_id}}.fa",
-        pathways = rules.gapseq_find_pathways_bin.output.pathways,
-        reactions = rules.gapseq_find_pathways_bin.output.reactions,
-        transport = rules.gapseq_find_transport_bin.output.transport
-    output:
-        draft = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-draft.RDS",
-        rxnWeights = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-rxnWeights.RDS",
-        rxnXgenes = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}-rxnXgenes.RDS"
-    params:
-        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq draft \
-            -r {input.reactions} \
-            -t {input.transport} \
-            -p {input.pathways} \
-            -c {input.bin}
-        """
-
-rule gapseq_fill_bin:
-    """
-    Fill metabolic model with media-specific gap-filling
-    """
-    input:
-        draft = rules.gapseq_draft_bin.output.draft,
-        rxnWeights = rules.gapseq_draft_bin.output.rxnWeights,
-        rxnXgenes = rules.gapseq_draft_bin.output.rxnXgenes,
-        media = lambda wildcards: f"{MEDIA_DIR}/{SAMPLE_MEDIA[wildcards.sample]}_media.csv"
-    output:
-        model = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}/{{bin_id}}.RDS"
-    params:
-        outdir = f"{GAPSEQ_DIR}/bins/{{sample}}/{{bin_id}}"
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq fill \
-            -m {input.draft} \
-            -c {input.rxnWeights} \
-            -g {input.rxnXgenes} \
-            -n {input.media}
-        """
-# Aggregate rule for all bins of a sample
-
-def get_all_bin_outputs(wildcards):
-    """
-    Get all expected outputs for bins of a sample - handles no bins case
-    """
-    checkpoint_output = checkpoints.get_bins.get(**wildcards).output[0]
+    import pandas as pd
+    import glob
+    import os
     
-    # Read the bins list file
-    with open(checkpoint_output) as f:
-        content = f.read().strip()
+    metadata = pd.read_csv("input/meta_input_pipeline.csv")
+    expected_models = []
     
-    # Check if there are no bins
-    if content == "no_bins_found" or not content:
-        # Return empty list - no bin processing needed
+    # Get all existing genomes
+    genome_dir = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk"
+    if not os.path.exists(genome_dir):
         return []
     
-    # Process each bin
-    outputs = []
-    with open(checkpoint_output) as f:
-        bin_ids = [line.strip() for line in f if line.strip() and line.strip() != "no_bins_found"]
+    existing_genomes = [os.path.basename(f).replace('.fa', '') 
+                       for f in glob.glob(f"{genome_dir}/*.fa")]
     
-    for bin_id in bin_ids:
-        outputs.extend([
-            f"{PRODIGAL_DIR}/bins/{wildcards.sample}/{bin_id}/proteins.faa",
-            f"{GAPSEQ_DIR}/bins/{wildcards.sample}/{bin_id}/{bin_id}_model.RDS"
-        ])
+    # For each genome, determine which media it should have models for
+    for genome in existing_genomes:
+        genome_media = []
+        
+        if genome == "Marinacidobacteraceae":
+            # FASTA sample - check all media columns
+            for media in ["Taurine", "Creatinine", "Carnitine", "Xylan", "Chitin"]:
+                if media in metadata.columns:
+                    samples = metadata[media].dropna()
+                    if any(str(s).endswith('.fa') for s in samples):
+                        genome_media.append(media)
+        else:
+            # MAG sample - get sample ID and check media
+            sample_id = genome.split('_')[0]
+            
+            for media in ["Taurine", "Creatinine", "Carnitine", "Xylan", "Chitin"]:
+                if media in metadata.columns:
+                    samples = metadata[media].dropna()
+                    for s in samples:
+                        s_str = str(s)
+                        if '.' in s_str and not s_str.endswith('.fa'):
+                            s_str = str(int(float(s_str)))
+                        if s_str == sample_id:
+                            genome_media.append(media)
+                            break
+        
+        # Add expected models for this genome
+        for media in genome_media:
+            expected_models.append(f"{RESULTS_DIR}/12_gapseq_models/{genome}_{media}.RDS")
     
-    return outputs
+    return expected_models
 
-
-rule process_all_bins:
-    """
-    Process all bins for a sample - handles no bins case
-    """
+# Update the aggregation rule to include all genome-media combinations
+rule gapseq_all_models_done:
     input:
-        get_all_bin_outputs,
-        gtdbtk_parsed = f"{GTDBTK_DIR}/batch_results_parsed.txt"
+        models = [f"{RESULTS_DIR}/12_gapseq_models/{genome}_{media}.RDS" 
+                  for genome, media in GENOME_MEDIA_COMBINATIONS]
     output:
-        f"{BINS_DIR}/{{sample}}/all_bins_processed.txt"
+        done = f"{RESULTS_DIR}/12_gapseq_models/all_models_complete.txt"
     shell:
         """
-        echo "Bins processing complete for {wildcards.sample}" > {output}
+        echo "Created models for all genome-media combinations:" > {output.done}
+        echo "Total models: {len(input.models)}" >> {output.done}
         
-        # Count processed bins
-        if [ -d {GAPSEQ_DIR}/bins/{wildcards.sample} ]; then
-            NUM_BINS=$(ls {GAPSEQ_DIR}/bins/{wildcards.sample}/*/{{*}}_model.RDS 2>/dev/null | wc -l || echo "0")
-        else
-            NUM_BINS=0
-        fi
+        # Count models per media type
+        for media in Taurine Creatinine Carnitine Xylan Chitin; do
+            count=$(ls {RESULTS_DIR}/12_gapseq_models/*_${{media}}.RDS 2>/dev/null | wc -l)
+            echo "$media: $count models" >> {output.done}
+        done
+        """
+
+rule gapseq_multi_media_complete:
+    input:
+        models = get_all_genome_media_models
+    output:
+        done = f"{RESULTS_DIR}/12_gapseq_models/multi_media_complete.txt",
+        summary = f"{RESULTS_DIR}/12_gapseq_models/multi_media_summary.txt"
+    run:
+        import os
         
-        echo "Processed bins: $NUM_BINS" >> {output}
-        """
-# ================== MODULE 8: Process FASTA samples (no individual GTDB-Tk) ==================
+        # Count models by type
+        media_counts = {"Taurine": 0, "Creatinine": 0, "Carnitine": 0, "Xylan": 0, "Chitin": 0}
+        genome_counts = {}
+        total_models = 0
+        
+        for model_path in input.models:
+            if os.path.exists(model_path):
+                total_models += 1
+                # Extract genome and media from filename
+                basename = os.path.basename(model_path).replace('.RDS', '')
+                parts = basename.rsplit('_', 1)
+                if len(parts) == 2:
+                    genome, media = parts
+                    
+                    # Count by media
+                    if media in media_counts:
+                        media_counts[media] += 1
+                    
+                    # Count by genome
+                    if genome not in genome_counts:
+                        genome_counts[genome] = []
+                    genome_counts[genome].append(media)
+        
+        # Write summary
+        with open(output.summary, 'w') as f:
+            f.write(f"Multi-Media Gap-Filling Summary\n")
+            f.write(f"================================\n\n")
+            f.write(f"Total models created: {total_models}\n")
+            f.write(f"Total genomes: {len(genome_counts)}\n\n")
+            
+            f.write("Models per media type:\n")
+            for media, count in sorted(media_counts.items()):
+                f.write(f"  {media}: {count} models\n")
+            
+            f.write(f"\nGenomes with multiple media:\n")
+            for genome, media_list in sorted(genome_counts.items()):
+                if len(media_list) > 1:
+                    f.write(f"  {genome}: {', '.join(media_list)}\n")
+            
+            f.write(f"\nAll genome-media combinations:\n")
+            for genome, media_list in sorted(genome_counts.items()):
+                for media in media_list:
+                    f.write(f"  {genome}_{media}.RDS\n")
+        
+        # Write completion marker
+        with open(output.done, 'w') as f:
+            f.write(f"Completed {total_models} multi-media models\n")
+            for model_path in sorted(input.models):
+                if os.path.exists(model_path):
+                    f.write(f"  ✓ {os.path.basename(model_path)}\n")
 
-rule prodigal_genes_fasta:
-    """
-    Predict genes for pre-assembled genomes
-    """
-    input:
-        genome = lambda wildcards: FASTA_PATHS.get(wildcards.sample, f"{INPUT_DIR}/{wildcards.sample}")
-    output:
-        proteins = f"{PRODIGAL_DIR}/fasta/{{sample}}/proteins.faa",
-        genes = f"{PRODIGAL_DIR}/fasta/{{sample}}/genes.fna",
-        gff = f"{PRODIGAL_DIR}/fasta/{{sample}}/genes.gff"
-    container: CONTAINERS["prodigal"]
-    shell:
-        """
-        prodigal \
-            -i {input.genome} \
-            -a {output.proteins} \
-            -d {output.genes} \
-            -f gff \
-            -o {output.gff} \
-            -p single
-        """
-
-rule gapseq_find_pathways_fasta:
-    """
-    Find pathways for pre-assembled genomes
-    """
-    input:
-        genome = lambda wildcards: FASTA_PATHS.get(wildcards.sample, f"{INPUT_DIR}/{wildcards.sample}")
-    output:
-        pathways = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-all-Pathways.tbl",
-        reactions = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-all-Reactions.tbl"
-    params:
-        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
-    threads: 1
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq find -p all {input.genome}
-        """
-
-rule gapseq_find_transport_fasta:
-    """
-    Find transporters for pre-assembled genomes
-    """
-    input:
-        genome = lambda wildcards: FASTA_PATHS.get(wildcards.sample, f"{INPUT_DIR}/{wildcards.sample}")
-    output:
-        transport = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-Transporter.tbl"
-    params:
-        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
-    threads: 1
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq find-transport {input.genome}
-        """
-
-rule gapseq_draft_fasta:
-    """
-    Create draft model for pre-assembled genomes
-    """
-    input:
-        genome = lambda wildcards: FASTA_PATHS.get(wildcards.sample, f"{INPUT_DIR}/{wildcards.sample}"),
-        pathways = rules.gapseq_find_pathways_fasta.output.pathways,
-        reactions = rules.gapseq_find_pathways_fasta.output.reactions,
-        transport = rules.gapseq_find_transport_fasta.output.transport
-    output:
-        draft = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-draft.RDS",
-        rxnWeights = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-rxnWeights.RDS",
-        rxnXgenes = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}-rxnXgenes.RDS"
-    params:
-        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq draft \
-            -r {input.reactions} \
-            -t {input.transport} \
-            -p {input.pathways} \
-            -c {input.genome}
-        """
-
-rule gapseq_fill_fasta:
-    """
-    Fill model for pre-assembled genomes
-    """
-    input:
-        draft = rules.gapseq_draft_fasta.output.draft,
-        rxnWeights = rules.gapseq_draft_fasta.output.rxnWeights,
-        rxnXgenes = rules.gapseq_draft_fasta.output.rxnXgenes,
-        media = lambda wildcards: f"{MEDIA_DIR}/{SAMPLE_MEDIA[wildcards.sample]}_media.csv"
-    output:
-        model = f"{GAPSEQ_DIR}/fasta/{{sample}}/{{sample}}.RDS"
-    params:
-        outdir = f"{GAPSEQ_DIR}/fasta/{{sample}}"
-    container: CONTAINERS["gapseq"]
-    shell:
-        """
-        cd {params.outdir}
-        gapseq fill \
-            -m {input.draft} \
-            -c {input.rxnWeights} \
-            -g {input.rxnXgenes} \
-            -n {input.media}
-        """
-# ================== MODULE 9: Final Quality Control ==================
-
-rule final_multiqc:
-    """
-    Generate final MultiQC report combining all results
-    """
-    input:
-        expand(f"{TRIMMED_DIR}/{{sample}}_R1_001.fastq.gz_trimming_report.txt", sample=FASTQ_SAMPLES),
-        expand(f"{QC_DIR}/assembly/{{sample}}/report.txt", sample=FASTQ_SAMPLES),
-        expand(f"{CHECKM_DIR}/{{sample}}/checkm_results.txt", sample=FASTQ_SAMPLES)
-    output:
-        report = f"{FINAL_QC_DIR}/final_report.html"
-    params:
-        outdir = FINAL_QC_DIR
-    container: CONTAINERS["multiqc"]
-    shell:
-        """
-        multiqc \
-            {TRIMMED_DIR} \
-            {QC_DIR} \
-            {CHECKM_DIR} \
-            -o {params.outdir} \
-            -n final_report.html \
-            --force
-        """

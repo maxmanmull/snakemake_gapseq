@@ -1,7 +1,0 @@
-# FASTA file paths for pipeline (multi-media version)
-fasta_paths:
-  Marinacidobacteraceae.fa_Taurine: "/lustre/BIF/nobackup/mulle088/snakemake/input/Marinacidobacteraceae.fa"
-  Marinacidobacteraceae.fa_Creatinine: "/lustre/BIF/nobackup/mulle088/snakemake/input/Marinacidobacteraceae.fa"
-  Marinacidobacteraceae.fa_Carnitine: "/lustre/BIF/nobackup/mulle088/snakemake/input/Marinacidobacteraceae.fa"
-  Marinacidobacteraceae.fa_Xylan: "/lustre/BIF/nobackup/mulle088/snakemake/input/Marinacidobacteraceae.fa"
-  Marinacidobacteraceae.fa_Chitin: "/lustre/BIF/nobackup/mulle088/snakemake/input/Marinacidobacteraceae.fa"

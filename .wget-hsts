@@ -1,4 +1,4 @@
 # HSTS 1.0 Known Hosts database for GNU Wget.
 # Edit at your own risk.
 # <hostname>	<port>	<incl. subdomains>	<created>	<max-age>
-zenodo.org	0	1	1756328244	31556926
+zenodo.org	0	1	1756380009	31556926

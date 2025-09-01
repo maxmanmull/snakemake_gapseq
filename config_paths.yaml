@@ -1,3 +1,0 @@
-# FASTA file paths for pipeline
-fasta_paths:
-  Marinacidobacteraceae.fa: "/lustre/BIF/nobackup/mulle088/snakemake/input/Marinacidobacteraceae.fa"
