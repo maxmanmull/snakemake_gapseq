@@ -43,7 +43,9 @@ rule all:
         expand(f"{RESULTS_DIR}/06_good_bins/{{sample}}/done.txt", sample=FASTQ_SAMPLES),
         f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/collected.txt",
         f"{RESULTS_DIR}/08_gtdbtk/done.txt",
-        f"{RESULTS_DIR}/12_gapseq_models/multi_media_complete.txt"
+        f"{RESULTS_DIR}/12_gapseq_models/multi_media_complete.txt",
+        f"{RESULTS_DIR}/13_antismash/all_complete.txt",
+        f"{RESULTS_DIR}/14_cazymes/all_done.txt"        
 
 # Rule 1: Trim reads with Trim-Galore
 rule trim_reads:
@@ -646,3 +648,181 @@ rule gapseq_multi_media_complete:
                 if os.path.exists(model_path):
                     f.write(f"  ✓ {os.path.basename(model_path)}\n")
 
+
+rule antismash_single:
+    input:
+        genome = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/{{genome}}.fa",
+    output:
+        done = f"{RESULTS_DIR}/13_antismash/{{genome}}/done.txt",
+        json = f"{RESULTS_DIR}/13_antismash/{{genome}}/{{genome}}.json",
+        gbk = f"{RESULTS_DIR}/13_antismash/{{genome}}/{{genome}}.gbk"
+    params:
+        outdir = f"{RESULTS_DIR}/13_antismash/{{genome}}",
+        antismash_container = f"{SINGULARITY_DIR}/antismash-standalone-nonfree-6.0.0.img"
+    threads: 8
+    shell:
+        """
+        mkdir -p {params.outdir}
+        # Run antiSMASH
+        singularity exec {params.antismash_container} \
+            antismash \
+            --taxon bacteria \
+            --genefinding-tool prodigal \
+            --output-dir {params.outdir} \
+            --output-basename {wildcards.genome} \
+            --cpus {threads} \
+            --minimal \
+            --enable-genefunctions \
+            --enable-lanthipeptides \
+            --enable-lassopeptides \
+            --enable-nrps-pks \
+            --enable-sactipeptides \
+            --enable-t2pks \
+            --enable-thiopeptides \
+            --enable-tta \
+            {input.genome}
+        touch {output.done}
+        """
+
+def aggregate_antismash_outputs(wildcards):
+    checkpoint_output = checkpoints.get_genome_list.get(**wildcards).output[0]
+    with open(checkpoint_output) as f:
+        genomes = [line.strip() for line in f if line.strip()]
+    return expand(f"{RESULTS_DIR}/13_antismash/{{genome}}/done.txt", genome=genomes)
+
+rule antismash_summary:
+    input:
+        antismash_done = aggregate_antismash_outputs,
+        # Ensure gapseq is complete before summarizing antiSMASH
+        gapseq_done = f"{RESULTS_DIR}/12_gapseq_models/multi_media_complete.txt"
+    output:
+        summary = f"{RESULTS_DIR}/13_antismash/bgc_summary.txt",
+        done = f"{RESULTS_DIR}/13_antismash/all_complete.txt"
+    params:
+        antismash_dir = f"{RESULTS_DIR}/13_antismash"
+    run:
+        import json
+        import os
+        
+        bgc_summary = []
+        genome_bgc_counts = {}
+        bgc_types = {}
+        
+        # Parse each genome's antiSMASH results
+        for done_file in input.antismash_done:
+            genome_dir = os.path.dirname(done_file)
+            genome_name = os.path.basename(genome_dir)
+            json_file = os.path.join(genome_dir, f"{genome_name}.json")
+            
+            if os.path.exists(json_file):
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                    
+                    # Count BGCs for this genome
+                    records = data.get('records', [])
+                    total_bgcs = 0
+                    genome_bgc_types = []
+                    
+                    for record in records:
+                        areas = record.get('areas', [])
+                        for area in areas:
+                            total_bgcs += 1
+                            products = area.get('products', [])
+                            for product in products:
+                                genome_bgc_types.append(product)
+                                if product not in bgc_types:
+                                    bgc_types[product] = 0
+                                bgc_types[product] += 1
+                    
+                    genome_bgc_counts[genome_name] = {
+                        'total': total_bgcs,
+                        'types': genome_bgc_types
+                    }
+                    
+                except Exception as e:
+                    print(f"Error parsing {json_file}: {e}")
+                    genome_bgc_counts[genome_name] = {'total': 0, 'types': []}
+            else:
+                genome_bgc_counts[genome_name] = {'total': 0, 'types': []}
+        
+        # Write summary
+        with open(output.summary, 'w') as f:
+            f.write("antiSMASH Biosynthetic Gene Cluster Summary\n")
+            f.write("=" * 50 + "\n\n")
+            
+            f.write(f"Total genomes analyzed: {len(genome_bgc_counts)}\n")
+            f.write(f"Total BGCs found: {sum(g['total'] for g in genome_bgc_counts.values())}\n\n")
+            
+            f.write("BGC types found:\n")
+            for bgc_type, count in sorted(bgc_types.items(), key=lambda x: x[1], reverse=True):
+                f.write(f"  {bgc_type}: {count}\n")
+            
+            f.write("\nBGCs per genome:\n")
+            for genome, info in sorted(genome_bgc_counts.items(), key=lambda x: x[1]['total'], reverse=True):
+                if info['total'] > 0:
+                    f.write(f"  {genome}: {info['total']} BGCs\n")
+                    type_counts = {}
+                    for t in info['types']:
+                        if t not in type_counts:
+                            type_counts[t] = 0
+                        type_counts[t] += 1
+                    for t, c in sorted(type_counts.items()):
+                        f.write(f"    - {t}: {c}\n")
+                else:
+                    f.write(f"  {genome}: No BGCs found\n")
+        
+        # Write completion marker
+        with open(output.done, 'w') as f:
+            f.write(f"antiSMASH analysis complete for {len(genome_bgc_counts)} genomes\n")
+
+
+# Rule 14: Run dbCAN for CAZyme annotation
+rule run_dbcan:
+    input:
+        genome = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/{{genome}}.fa"
+    output:
+        overview = f"{RESULTS_DIR}/14_cazymes/{{genome}}/overview.txt",
+        done = f"{RESULTS_DIR}/14_cazymes/{{genome}}/done.txt"
+    params:
+        outdir = f"{RESULTS_DIR}/14_cazymes/{{genome}}",
+        dbcan_container = f"{SINGULARITY_DIR}/run_dbcan_latest.sif",  # Updated container
+        db_dir = "/lustre/BIF/nobackup/mulle088/databases/dbcan"
+    threads: 8
+    shell:
+        """
+        mkdir -p {params.outdir}
+        
+        # Run dbCAN with the latest container
+        singularity exec {params.dbcan_container} \
+            run_dbcan \
+            {input.genome} \
+            prok \
+            --out_dir {params.outdir} \
+            --db_dir {params.db_dir} \
+            --use_signalP=FALSE \
+            --dia_cpu {threads} \
+            --hmm_cpu {threads}
+        
+        touch {output.done}
+        """
+
+# Aggregate CAZyme results for all genomes
+def aggregate_cazyme_outputs(wildcards):
+    checkpoint_output = checkpoints.get_genome_list.get(**wildcards).output[0]
+    with open(checkpoint_output) as f:
+        genomes = [line.strip() for line in f if line.strip()]
+    return expand(f"{RESULTS_DIR}/14_cazymes/{{genome}}/done.txt", genome=genomes)
+
+# Mark CAZyme analysis complete
+rule cazymes_complete:
+    input:
+        aggregate_cazyme_outputs
+    output:
+        f"{RESULTS_DIR}/14_cazymes/all_done.txt"
+    shell:
+        """
+        echo "CAZyme analysis complete" > {output}
+        echo "Analyzed genomes:" >> {output}
+        ls -d {RESULTS_DIR}/14_cazymes/*/ | wc -l >> {output}
+        """
