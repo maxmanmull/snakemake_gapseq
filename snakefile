@@ -45,8 +45,9 @@ rule all:
         f"{RESULTS_DIR}/08_gtdbtk/done.txt",
         f"{RESULTS_DIR}/12_gapseq_models/multi_media_complete.txt",
         f"{RESULTS_DIR}/13_antismash/all_complete.txt",
-        f"{RESULTS_DIR}/14_cazymes/all_done.txt"        
-
+        f"{RESULTS_DIR}/14_cazymes/all_done.txt",        
+        f"{RESULTS_DIR}/15_qc_summary/mag_quality_master.tsv",
+        f"{RESULTS_DIR}/15_qc_summary/mag_quality_summary.txt"
 # Rule 1: Trim reads with Trim-Galore
 rule trim_reads:
     input:
@@ -826,3 +827,187 @@ rule cazymes_complete:
         echo "Analyzed genomes:" >> {output}
         ls -d {RESULTS_DIR}/14_cazymes/*/ | wc -l >> {output}
         """
+
+# Rule 15: Assess quality of MAGs (good bins) with QUAST
+rule mag_assembly_stats:
+    input:
+        mag = f"{RESULTS_DIR}/07_all_genomes_for_gtdbtk/{{genome}}.fa"
+    output:
+        report = f"{RESULTS_DIR}/15_qc_summary/mag_stats/{{genome}}/report.tsv",
+        stats = f"{RESULTS_DIR}/15_qc_summary/mag_stats/{{genome}}_stats.tsv"
+    params:
+        outdir = f"{RESULTS_DIR}/15_qc_summary/mag_stats/{{genome}}",
+        quast_container = f"{SINGULARITY_DIR}/quay.io-biocontainers-quast-5.2.0--py39pl5321h2add14b_1.img"
+    threads: 4
+    shell:
+        """
+        # Run QUAST on MAG
+        singularity exec {params.quast_container} \
+            quast.py \
+            {input.mag} \
+            -o {params.outdir} \
+            --threads {threads} \
+            --min-contig 500 \
+            --no-plots
+        
+        # Extract key MAG metrics
+        echo -e "Genome\tTotal_contigs\tTotal_length\tN50\tN75\tN90\tLargest_contig\tGC_content" > {output.stats}
+        
+        awk -F'\t' '
+            NR==1 {{for(i=1;i<=NF;i++) col[$i]=i}}
+            /^# contigs \(>= 0 bp\)/ {{contigs=$2}}
+            /^Total length \(>= 0 bp\)/ {{total=$2}}
+            /^N50/ && !/N50[0-9]/ {{n50=$2}}
+            /^N75/ {{n75=$2}}
+            /^N90/ {{n90=$2}}
+            /^Largest contig/ {{largest=$2}}
+            /^GC \(%\)/ {{gc=$2}}
+            END {{
+                print "{wildcards.genome}", contigs, total, n50, n75, n90, largest, gc
+            }}
+        ' {output.report} | tr ' ' '\t' >> {output.stats}
+        """
+
+# Aggregate function for MAG stats
+def aggregate_mag_stats(wildcards):
+    checkpoint_output = checkpoints.get_genome_list.get(**wildcards).output[0]
+    with open(checkpoint_output) as f:
+        genomes = [line.strip() for line in f if line.strip()]
+    return expand(f"{RESULTS_DIR}/15_qc_summary/mag_stats/{{genome}}_stats.tsv", genome=genomes)
+
+# Rule 16: Comprehensive MAG quality report combining CheckM + QUAST + GTDB-Tk
+rule comprehensive_mag_qc:
+    input:
+        mag_stats = aggregate_mag_stats,
+        checkm_tables = expand(f"{RESULTS_DIR}/05_checkm/{{sample}}/checkm_table.tsv", sample=FASTQ_SAMPLES),
+        gtdbtk = f"{RESULTS_DIR}/08_gtdbtk/gtdbtk.bac120.summary.tsv"
+    output:
+        master = f"{RESULTS_DIR}/15_qc_summary/mag_quality_master.tsv",
+        summary = f"{RESULTS_DIR}/15_qc_summary/mag_quality_summary.txt",
+        failed = f"{RESULTS_DIR}/15_qc_summary/failed_mags.tsv"
+    run:
+        import pandas as pd
+        import os
+        
+        # Read all MAG stats
+        mag_stats_dfs = []
+        for stats_file in input.mag_stats:
+            df = pd.read_csv(stats_file, sep='\t')
+            mag_stats_dfs.append(df)
+        mag_stats_df = pd.concat(mag_stats_dfs, ignore_index=True)
+        
+        # Read GTDB-Tk
+        gtdbtk_df = pd.read_csv(input.gtdbtk, sep='\t')
+        gtdbtk_dict = {row['user_genome']: {
+            'classification': row.get('classification', 'Unknown'),
+            'fastani_ani': row.get('fastani_ani', 'N/A'),
+            'fastani_reference': row.get('fastani_reference', 'N/A')
+        } for _, row in gtdbtk_df.iterrows()}
+        
+        # Compile CheckM data for all MAGs
+        checkm_data = {}
+        for sample in FASTQ_SAMPLES:
+            checkm_file = f"{RESULTS_DIR}/05_checkm/{sample}/checkm_table.tsv"
+            if os.path.exists(checkm_file):
+                with open(checkm_file, 'r') as f:
+                    for line in f.readlines()[1:]:
+                        if line.strip():
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 7:
+                                bin_id = parts[0]
+                                mag_name = f"{sample}_{bin_id}"
+                                checkm_data[mag_name] = {
+                                    'completeness': float(parts[5]),
+                                    'contamination': float(parts[6]),
+                                    'strain_heterogeneity': float(parts[7]) if len(parts) > 7 else 0
+                                }
+        
+        # Add reference genome to CheckM data (100% complete, 0% contamination assumed)
+        for fasta in FASTA_SAMPLES:
+            genome_name = fasta.replace('.fa', '')
+            checkm_data[genome_name] = {
+                'completeness': 100.0,
+                'contamination': 0.0,
+                'strain_heterogeneity': 0.0
+            }
+        
+        # Create master table
+        master_data = []
+        for _, row in mag_stats_df.iterrows():
+            genome = row['Genome']
+            
+            # Get CheckM metrics
+            checkm = checkm_data.get(genome, {})
+            
+            # Get GTDB-Tk classification
+            gtdb = gtdbtk_dict.get(genome, {})
+            
+            # Quality tier determination
+            completeness = checkm.get('completeness', 0)
+            contamination = checkm.get('contamination', 100)
+            
+            if completeness >= 90 and contamination <= 5:
+                quality_tier = "High"
+            elif completeness >= 70 and contamination <= 10:
+                quality_tier = "Medium"
+            elif completeness >= 50 and contamination <= 10:
+                quality_tier = "Low"
+            else:
+                quality_tier = "Failed"
+            
+            master_data.append({
+                'Genome': genome,
+                'Quality_Tier': quality_tier,
+                'Completeness': completeness,
+                'Contamination': contamination,
+                'Strain_Het': checkm.get('strain_heterogeneity', 0),
+                'Size_Mb': round(row['Total_length']/1000000, 2) if row['Total_length'] else 0,
+                'Contigs': row['Total_contigs'],
+                'N50': row['N50'],
+                'GC%': row['GC_content'],
+                'GTDB_Classification': gtdb.get('classification', 'Not classified'),
+                'ANI%': gtdb.get('fastani_ani', 'N/A')
+            })
+        
+        master_df = pd.DataFrame(master_data)
+        master_df = master_df.sort_values(['Quality_Tier', 'Completeness'], ascending=[True, False])
+        master_df.to_csv(output.master, sep='\t', index=False)
+        
+        # Failed MAGs
+        failed_df = master_df[master_df['Quality_Tier'] == 'Failed']
+        failed_df.to_csv(output.failed, sep='\t', index=False)
+        
+        # Summary report
+        with open(output.summary, 'w') as f:
+            f.write("MAG Quality Assessment Summary\n")
+            f.write("=" * 60 + "\n\n")
+            
+            # Quality tiers
+            tier_counts = master_df['Quality_Tier'].value_counts()
+            f.write("Quality Tier Distribution:\n")
+            for tier in ['High', 'Medium', 'Low', 'Failed']:
+                count = tier_counts.get(tier, 0)
+                pct = (count/len(master_df)*100) if len(master_df) > 0 else 0
+                f.write(f"  {tier}: {count} ({pct:.1f}%)\n")
+            
+            f.write(f"\nTotal MAGs: {len(master_df)}\n")
+            f.write(f"Average completeness: {master_df['Completeness'].mean():.1f}%\n")
+            f.write(f"Average contamination: {master_df['Contamination'].mean():.1f}%\n")
+            f.write(f"Average N50: {master_df['N50'].mean():.0f} bp\n")
+            f.write(f"Average genome size: {master_df['Size_Mb'].mean():.2f} Mb\n")
+            
+            # Top MAGs
+            f.write("\nTop 10 MAGs by completeness:\n")
+            top_mags = master_df.nlargest(10, 'Completeness')[['Genome', 'Completeness', 'Contamination', 'Size_Mb', 'N50']]
+            for _, row in top_mags.iterrows():
+                f.write(f"  {row['Genome']}: {row['Completeness']:.1f}% complete, "
+                       f"{row['Contamination']:.1f}% contam, {row['Size_Mb']:.2f} Mb, N50={row['N50']}\n")
+            
+            # Taxonomy distribution
+            f.write("\nTaxonomic distribution (genus level):\n")
+            master_df['Genus'] = master_df['GTDB_Classification'].apply(
+                lambda x: x.split(';g__')[1].split(';')[0] if ';g__' in x else 'Unknown'
+            )
+            genus_counts = master_df[master_df['Genus'] != 'Unknown']['Genus'].value_counts().head(10)
+            for genus, count in genus_counts.items():
+                f.write(f"  {genus}: {count}\n")
